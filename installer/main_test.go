@@ -141,6 +141,33 @@ func TestSummaryOffersAFullGCPCleanup(t *testing.T) {
 	}
 }
 
+// The wizard's "Next steps" panel is gone once the alt screen closes, so a
+// demo install must leave the full walkthrough in the summary — and an
+// install that skipped the demo must not tell users to poke a counter that
+// does not exist.
+func TestSummaryRecapsTheDemoNextSteps(t *testing.T) {
+	builder := snapshot.NewBuilder(t.TempDir(), true)
+	portForward, demo := builder.NextSteps()
+
+	st := state.NewSetup()
+	st.DemoDeployed = true
+	out := captureStdout(t, func() {
+		printSummary(&ui.App{Completed: true}, &ui.Deps{Setup: st, Builder: builder}, true)
+	})
+	for _, want := range append([]string{portForward}, demo...) {
+		if !strings.Contains(out, want) {
+			t.Errorf("demo summary is missing next step %q:\n%s", want, out)
+		}
+	}
+
+	out = captureStdout(t, func() {
+		printSummary(&ui.App{Completed: true}, &ui.Deps{Setup: state.NewSetup(), Builder: builder}, true)
+	})
+	if strings.Contains(out, "Next steps") {
+		t.Errorf("summary recaps demo steps for an install that skipped the demo:\n%s", out)
+	}
+}
+
 // The summary tells users to paste the script's invocation, so the script has
 // to exist, parse, and be executable.
 func TestCleanupGcpScriptIsRunnable(t *testing.T) {

@@ -121,10 +121,12 @@ func main() {
 	printSummary(app, deps, cleaned)
 }
 
-// printSummary leaves a plain-text recap in the terminal after the alt
-// screen closes, like the prototype's exit panel. cleaned reports whether
-// Cleanup actually removed the managed tree — under --dry-run it never runs,
-// and it can fail, so the summary must not claim more than happened.
+// printSummary leaves a recap in the terminal after the alt screen closes,
+// like the prototype's exit panel, broken into headed sections so the facts,
+// the teardown commands, and the demo walkthrough don't run together.
+// cleaned reports whether Cleanup actually removed the managed tree — under
+// --dry-run it never runs, and it can fail, so the summary must not claim
+// more than happened.
 func printSummary(app *ui.App, deps *ui.Deps, cleaned bool) {
 	st, b := deps.Setup, deps.Builder
 	if !app.Completed {
@@ -137,42 +139,69 @@ func printSummary(app *ui.App, deps *ui.Deps, cleaned bool) {
 		fmt.Println(b.UpgradeSummary(st, installedDir, nextDir))
 		return
 	}
-	fmt.Println(theme.Good.Render("Substrate installed."))
-	fmt.Printf("  project:  %s\n  cluster:  %s (%s)\n  bucket:   gs://%s\n  images:   %s\n",
+	section := func(title string) { fmt.Println("\n" + theme.Title.Render(title)) }
+	note := func(lines ...string) {
+		for _, l := range lines {
+			fmt.Println(theme.Subtle.Render("  " + l))
+		}
+	}
+	command := func(cmd string) { fmt.Println("  " + theme.CommandLine.Render(cmd)) }
+
+	fmt.Println(theme.Good.Render(theme.GlyphDone + " Substrate installed"))
+
+	section("Resources")
+	fmt.Printf("  project    %s\n  cluster    %s (%s)\n  bucket     gs://%s\n  images     %s\n",
 		st.ProjectID, st.ClusterName, st.Zone, st.BucketName, st.ImageSummary())
 	if st.FilestoreCSIDeployed {
-		fmt.Println("  filestore: CSI driver deployed (gcp-filestore-csi-driver)")
+		fmt.Println("  filestore  CSI driver deployed (gcp-filestore-csi-driver)")
 	}
 	if st.AutoscaleEnabled {
-		fmt.Printf("  autoscaling: %s, %d–%d nodes\n", st.NodePool, st.AutoscaleMin, st.AutoscaleMax)
+		fmt.Printf("  autoscale  %s, %d–%d nodes\n", st.NodePool, st.AutoscaleMin, st.AutoscaleMax)
 	}
 	if st.DemoDeployed {
-		fmt.Println("  demo: counter deployed — see the next steps printed in the wizard.")
+		fmt.Println("  demo       counter deployed — next steps recapped below")
 	}
+
 	// The managed checkout is scratch space, so point teardown at a command
 	// that stands on its own. A checkout the user supplied is still where
 	// they left it, and the pasted `cd` is quoted — a space in the path would
 	// otherwise land it somewhere else; the prose mentions read better
 	// unquoted.
+	section("Source tree")
 	teardown := b.TeardownCommand(st, "")
 	switch {
 	case b.Managed && cleaned:
-		fmt.Printf("\nThe substrate tree was fetched to build your images and has been removed;\n")
-		fmt.Printf("re-running the installer fetches it again. Develop against your own clone.\n")
+		note("The substrate tree was fetched to build your images and has been removed;",
+			"re-running the installer fetches it again. Develop against your own clone.")
 	case b.Managed:
-		fmt.Printf("\nThe substrate tree, if fetched, is cached at %s;\n", b.Root)
-		fmt.Printf("it is removed once a real install succeeds. Develop against your own clone.\n")
+		note("The substrate tree, if fetched, is cached at "+b.Root+";",
+			"it is removed once a real install succeeds. Develop against your own clone.")
 	default:
-		fmt.Printf("\nYour substrate checkout at %s is untouched.\n", b.Root)
+		note("Your substrate checkout at " + b.Root + " is untouched.")
 		teardown = b.TeardownCommand(st, b.Root)
 	}
+
 	// Two teardown depths: delete only the control plane (keep the cluster),
 	// or delete everything this install created and stop the charges. The
 	// cleanup invocation carries the wizard's own answers so it can be run
 	// from a fresh clone weeks later.
-	fmt.Printf("\nDelete the Substrate control plane (keeping the cluster) with:\n  %s\n", teardown)
-	fmt.Println("\nDelete everything this install created in GCP — the cluster, the")
-	fmt.Printf("snapshot bucket, IAM bindings, and dashboards — with:\n  %s\n", cleanupCommand(st))
+	section("Teardown, when you're done")
+	note("Delete the Substrate control plane, keeping the cluster:")
+	command(teardown)
+	note("Delete everything this install created in GCP — the cluster, the",
+		"snapshot bucket, IAM bindings, and dashboards:")
+	command(cleanupCommand(st))
+
+	// The wizard's "Next steps" panel vanishes with the alt screen, so a demo
+	// install leaves a written copy behind.
+	if st.DemoDeployed {
+		section("Next steps — try the counter demo")
+		portForward, demo := b.NextSteps()
+		command(portForward)
+		for _, cmd := range demo {
+			command(cmd)
+		}
+	}
 }
 
 // cleanupCommand renders the tools/cleanup-gcp invocation for this install.

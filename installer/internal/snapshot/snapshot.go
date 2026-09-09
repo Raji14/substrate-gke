@@ -319,6 +319,27 @@ func (b *Builder) KubectlAteInstall() string {
 	return b.inEphemeralTree("go install ./cmd/kubectl-ate")
 }
 
+// NextSteps returns the commands the completion screen's "Next steps" panel
+// walks through: the router port-forward every install can use, then the
+// counter-demo tour. The exit summary reprints the same commands — the alt
+// screen erases the panel the moment the wizard closes.
+//
+// A managed checkout is removed once the install succeeds, so its steps
+// cannot ask the user to run anything inside it — they get the
+// self-contained kubectl-ate install instead.
+func (b *Builder) NextSteps() (portForward string, demo []string) {
+	installAte := `go install ./cmd/kubectl-ate    # run inside your substrate checkout`
+	if b.Managed {
+		installAte = b.KubectlAteInstall()
+	}
+	return "kubectl port-forward -n ate-system svc/atenet-router 8000:80", []string{
+		installAte,
+		"kubectl ate create atespace demo",
+		"kubectl ate create actor my-counter-1 -a demo --template=ate-demo-counter/counter",
+		`curl -X POST -H "Host: my-counter-1.demo.actors.resources.substrate.ate.dev" http://localhost:8000/`,
+	}
+}
+
 // ShellQuote renders s as a single-quoted POSIX shell word. Go's %q produces a
 // double-quoted string, which bash still expands — a `$` or a backtick in the
 // path would be interpreted rather than taken literally.

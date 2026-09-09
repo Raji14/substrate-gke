@@ -669,20 +669,15 @@ func (s *completeScreen) View(w int) string {
 		b.WriteString("\n" + theme.Subtle.Render("Press [y] to run `kubectl get pods -n ate-system` and see it live.") + "\n")
 	}
 
-	// A managed checkout is removed once the install succeeds, so its next
-	// steps cannot ask the user to run anything inside it — offer the
-	// self-contained install command instead.
-	installAte := `go install ./cmd/kubectl-ate    # run inside your substrate checkout`
-	if s.deps.Builder.Managed {
-		installAte = s.deps.Builder.KubectlAteInstall()
-	}
+	portForward, demo := s.deps.Builder.NextSteps()
 	next := theme.Title.Render("Next steps") + "\n" +
-		theme.CommandLine.Render("kubectl port-forward -n ate-system svc/atenet-router 8000:80") + "\n" +
-		theme.Subtle.Render("then, if you deployed the counter demo:") + "\n" +
-		theme.CommandLine.Render(installAte) + "\n" +
-		theme.CommandLine.Render("kubectl ate create atespace demo") + "\n" +
-		theme.CommandLine.Render("kubectl ate create actor my-counter-1 -a demo --template=ate-demo-counter/counter") + "\n" +
-		theme.CommandLine.Render(`curl -X POST -H "Host: my-counter-1.demo.actors.resources.substrate.ate.dev" http://localhost:8000/`)
+		theme.CommandLine.Render(portForward)
+	if st.DemoDeployed {
+		next += "\n" + theme.Subtle.Render("then, to try the counter demo:")
+		for _, cmd := range demo {
+			next += "\n" + theme.CommandLine.Render(cmd)
+		}
+	}
 	b.WriteString("\n" + theme.AccentPanel.Width(min(w-4, 92)).Render(next))
 	return b.String()
 }

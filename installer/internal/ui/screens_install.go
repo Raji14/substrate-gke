@@ -671,10 +671,12 @@ func (s *completeScreen) View(w int) string {
 
 	portForward, demo := s.deps.Builder.NextSteps()
 	next := theme.Title.Render("Next steps") + "\n" +
-		theme.CommandLine.Render(portForward) + "\n" +
-		theme.Subtle.Render("then, if you deployed the counter demo:")
-	for _, cmd := range demo {
-		next += "\n" + theme.CommandLine.Render(cmd)
+		theme.CommandLine.Render(portForward)
+	if st.DemoDeployed {
+		next += "\n" + theme.Subtle.Render("then, to try the counter demo:")
+		for _, cmd := range demo {
+			next += "\n" + theme.CommandLine.Render(cmd)
+		}
 	}
 	b.WriteString("\n" + theme.AccentPanel.Width(min(w-4, 92)).Render(next))
 	return b.String()

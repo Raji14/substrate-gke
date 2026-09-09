@@ -223,6 +223,21 @@ func TestCreateNewClusterPath(t *testing.T) {
 	}
 }
 
+// Skipping the demo must not leave the completion screen walking the user
+// through counter commands that point at nothing.
+func TestCompleteScreenShowsDemoStepsOnlyWhenDeployed(t *testing.T) {
+	deps := &Deps{Setup: state.NewSetup(), Builder: snapshot.NewBuilder(t.TempDir(), false)}
+	scr := newCompleteScreen(deps)
+
+	if out := scr.View(100); strings.Contains(out, "kubectl ate create") {
+		t.Errorf("demo steps shown though the demo was skipped:\n%s", out)
+	}
+	deps.Setup.DemoDeployed = true
+	if out := scr.View(100); !strings.Contains(out, "kubectl ate create") {
+		t.Errorf("demo steps missing after the demo was deployed:\n%s", out)
+	}
+}
+
 // TestViewsRenderAtEveryStep guards against panics in any screen's View.
 func TestViewsRenderAtEveryStep(t *testing.T) {
 	deps := &Deps{

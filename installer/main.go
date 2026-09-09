@@ -147,7 +147,7 @@ func printSummary(app *ui.App, deps *ui.Deps, cleaned bool) {
 		fmt.Printf("  autoscaling: %s, %d–%d nodes\n", st.NodePool, st.AutoscaleMin, st.AutoscaleMax)
 	}
 	if st.DemoDeployed {
-		fmt.Println("  demo: counter deployed — see the next steps printed in the wizard.")
+		fmt.Println("  demo: counter deployed — next steps recapped below.")
 	}
 	// The managed checkout is scratch space, so point teardown at a command
 	// that stands on its own. A checkout the user supplied is still where
@@ -173,6 +173,16 @@ func printSummary(app *ui.App, deps *ui.Deps, cleaned bool) {
 	fmt.Printf("\nDelete the Substrate control plane (keeping the cluster) with:\n  %s\n", teardown)
 	fmt.Println("\nDelete everything this install created in GCP — the cluster, the")
 	fmt.Printf("snapshot bucket, IAM bindings, and dashboards — with:\n  %s\n", cleanupCommand(st))
+	// The wizard's "Next steps" panel vanishes with the alt screen, so a demo
+	// install leaves a written copy behind.
+	if st.DemoDeployed {
+		portForward, demo := b.NextSteps()
+		fmt.Println("\nNext steps for the counter demo:")
+		fmt.Printf("  %s\n", portForward)
+		for _, cmd := range demo {
+			fmt.Printf("  %s\n", cmd)
+		}
+	}
 }
 
 // cleanupCommand renders the tools/cleanup-gcp invocation for this install.

@@ -50,12 +50,6 @@ type Deps struct {
 	UpgradeDir string
 }
 
-// logProvider is implemented by screens that run external commands.
-type logProvider interface {
-	LogLines() []string
-	LogTitle() string
-}
-
 // execCompProvider is implemented by screens that host an execComp.
 type execCompProvider interface {
 	logComp() *execComp
@@ -112,7 +106,11 @@ type App struct {
 	slash         textinput.Model
 	logView       viewport.Model
 	logTitle      string
-	quitting      bool
+	// logFromComp marks an overlay fed by the current screen's live
+	// component, so it can follow the stream instead of freezing at its
+	// opening snapshot.
+	logFromComp bool
+	quitting    bool
 
 	// Completed is set when the user reached the final screen.
 	Completed bool
@@ -215,7 +213,29 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return a.handleKey(m)
 	}
 
-	return a, a.cur.Update(msg)
+	cmd := a.cur.Update(msg)
+	// Command events keep flowing to the screen while the overlay is up;
+	// an overlay showing a live component follows them.
+	if a.over == overlayLog && a.logFromComp {
+		a.refreshLog()
+	}
+	return a, cmd
+}
+
+// refreshLog re-reads the live component's lines so an open overlay follows
+// a streaming command instead of freezing at its opening snapshot. The
+// scroll position is kept unless the user was at the bottom, which then
+// tracks the newest output like a tail -f.
+func (a *App) refreshLog() {
+	p, ok := a.cur.(execCompProvider)
+	if !ok || p.logComp() == nil {
+		return
+	}
+	atBottom := a.logView.AtBottom()
+	a.logView.SetContent(strings.Join(p.logComp().LogLines(), "\n"))
+	if atBottom {
+		a.logView.GotoBottom()
+	}
 }
 
 func (a *App) stopCurrent() {
@@ -322,12 +342,11 @@ func (a *App) openLog() {
 	var lines []string
 	var title string
 
+	a.logFromComp = false
 	if p, ok := a.cur.(execCompProvider); ok && p.logComp() != nil {
 		lines = p.logComp().LogLines()
 		title = p.logComp().LogTitle()
-	} else if ls, ok := a.cur.(logProvider); ok {
-		lines = ls.LogLines()
-		title = ls.LogTitle()
+		a.logFromComp = len(lines) > 0
 	}
 	if len(lines) == 0 && a.deps.LogPath != "" {
 		if data, err := os.ReadFile(a.deps.LogPath); err == nil {
@@ -367,11 +386,16 @@ func (a *App) logModalView(w, h int) string {
 	a.logView.Height = max(h-6, 3)
 
 	var b strings.Builder
-	header := theme.Title.Render("Log: " + a.logTitle)
+	// One line, always: a wrapped header would overflow the modal's exact
+	// line budget and clampHeight would chop the footer for it.
+	head := "Log: " + a.logTitle
 	if a.deps.LogPath != "" {
-		header += "  " + theme.Subtle.Render("("+a.deps.LogPath+")")
+		head += "  (" + a.deps.LogPath + ")"
 	}
-	b.WriteString(header + "\n")
+	if r := []rune(head); len(r) > max(w-4, 5) {
+		head = string(r[:max(w-4, 5)-1]) + "…"
+	}
+	b.WriteString(theme.Title.Render(head) + "\n")
 	b.WriteString(theme.Fainted.Render(strings.Repeat("─", max(w-4, 1))) + "\n")
 	b.WriteString(a.logView.View() + "\n")
 	b.WriteString(theme.Fainted.Render(strings.Repeat("─", max(w-4, 1))) + "\n")
@@ -422,7 +446,15 @@ func (a *App) View() string {
 	default:
 		content = a.cur.View(contentW)
 	}
-	content = clampHeight(content, bodyH)
+	// The screen itself knows whether a command failed, so the clamp choice
+	// is not left to sniffing rendered strings — raw output that merely
+	// contains "failed" cannot flip a healthy screen's cropping.
+	if p, ok := a.cur.(execCompProvider); ok && a.over == overlayNone &&
+		p.logComp() != nil && p.logComp().failed != nil {
+		content = clampHeightAroundFailure(content, bodyH)
+	} else {
+		content = clampHeight(content, bodyH)
+	}
 
 	var body string
 	if sidebarW > 0 {

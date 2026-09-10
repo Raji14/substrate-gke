@@ -80,6 +80,8 @@ func key(s string) tea.Msg {
 	switch s {
 	case "enter":
 		return tea.KeyMsg{Type: tea.KeyEnter}
+	case "ctrl+c":
+		return tea.KeyMsg{Type: tea.KeyCtrlC}
 	default:
 		panic("unknown key " + s)
 	}
@@ -1146,11 +1148,16 @@ func TestLogViewerOverlay(t *testing.T) {
 	}
 }
 
+// errorDetailRunner fails only the provision step: earlier specs (the
+// cluster probe among them) must succeed for the wizard to get there.
 type errorDetailRunner struct {
 	inner execx.Runner
 }
 
 func (r errorDetailRunner) Start(ctx context.Context, spec execx.Spec) <-chan execx.Event {
+	if spec.Label != "setup-gcp bootstrap" {
+		return r.inner.Start(ctx, spec)
+	}
 	ch := make(chan execx.Event, 4)
 	ch <- execx.Event{Line: "Step 1: initializing"}
 	ch <- execx.Event{Line: "Error from server (Forbidden): clusterrolebindings is forbidden", Stderr: true}
@@ -1206,9 +1213,17 @@ func TestClampHeightPreservesFailure(t *testing.T) {
 	b.WriteString("╰─────────────────────╯\n")
 
 	content := b.String()
-	// Even when Command failed is >15 lines from the bottom, clampHeight preserves the failure lines.
-	clamped := clampHeight(content, 10)
+	// Even when the tail panel below the banner is taller than the window,
+	// the failure-aware clamp keeps the banner and the guidance under it.
+	clamped := clampHeightAroundFailure(content, 10)
 	if !strings.Contains(clamped, "Command failed") || !strings.Contains(clamped, "Cause:") {
-		t.Errorf("clampHeight dropped failure lines:\n%s", clamped)
+		t.Errorf("clampHeightAroundFailure dropped failure lines:\n%s", clamped)
+	}
+	if !strings.Contains(clamped, "Press [v]") {
+		t.Errorf("clamp dropped the guidance below the banner:\n%s", clamped)
+	}
+	// The plain clamp keeps the top and never re-anchors on output content.
+	if plain := clampHeight(content, 3); !strings.HasPrefix(plain, "Header") {
+		t.Errorf("clampHeight no longer keeps the top:\n%s", plain)
 	}
 }

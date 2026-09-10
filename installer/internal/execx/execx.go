@@ -61,14 +61,27 @@ type Runner interface {
 	Start(ctx context.Context, spec Spec) <-chan Event
 }
 
-var ansi = regexp.MustCompile(`\x1b\[[0-9;]*[A-Za-z]`)
+var (
+	ansi = regexp.MustCompile(`\x1b\[[0-9;]*[A-Za-z]`)
+	// OSC sequences (terminal titles, hyperlinks) pass the CSI-only pattern
+	// and would reprogram the terminal if re-emitted by the log viewer.
+	osc = regexp.MustCompile(`\x1b\][^\x07\x1b]*(\x07|\x1b\\)?`)
+)
 
 const maxLineLen = 2000
 
-// Clean strips ANSI color codes and truncates pathological lines.
+// Clean strips ANSI escapes, resolves in-line carriage returns, and
+// truncates pathological lines.
 func Clean(line string) string {
-	line = ansi.ReplaceAllString(line, "")
 	line = strings.TrimRight(line, "\r\n")
+	// Progress redraws pack "10%\r50%\r100%" into one scanner line; a
+	// terminal would show only the last segment, so keep only that —
+	// re-emitting the \r would overwrite whatever panel row it lands on.
+	if i := strings.LastIndexByte(line, '\r'); i >= 0 {
+		line = line[i+1:]
+	}
+	line = ansi.ReplaceAllString(line, "")
+	line = osc.ReplaceAllString(line, "")
 	if len(line) > maxLineLen {
 		line = line[:maxLineLen] + "…"
 	}
@@ -174,13 +187,27 @@ func (r *Real) Start(ctx context.Context, spec Spec) <-chan Event {
 			defer wg.Done()
 			sc := bufio.NewScanner(rd)
 			sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+			// Once the UI abandons the channel (cancel stops its reader), a
+			// blocking send would wedge this goroutine forever: the log
+			// would lose its tail and END record, Drain would always time
+			// out, and the next command's log section would interleave with
+			// this one's. Keep logging to disk; just stop feeding the
+			// channel.
+			abandoned := false
 			for sc.Scan() {
 				raw := sc.Text()
 				if r != nil && r.Log != nil {
 					r.Log.LogLine(raw)
 				}
+				if abandoned {
+					continue
+				}
 				if line := Clean(raw); line != "" {
-					ch <- Event{Line: line, Stderr: isStderr}
+					select {
+					case ch <- Event{Line: line, Stderr: isStderr}:
+					case <-ctx.Done():
+						abandoned = true
+					}
 				}
 			}
 		}
@@ -193,7 +220,10 @@ func (r *Real) Start(ctx context.Context, spec Spec) <-chan Event {
 		if r != nil && r.Log != nil {
 			r.Log.LogCommandEnd(spec, waitErr, time.Since(start))
 		}
-		ch <- Event{Done: true, Err: waitErr}
+		select {
+		case ch <- Event{Done: true, Err: waitErr}:
+		case <-ctx.Done():
+		}
 	}()
 	return ch
 }

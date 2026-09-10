@@ -32,6 +32,25 @@ func collect(t *testing.T, ch <-chan Event) (lines []string, final Event) {
 	return nil, Event{}
 }
 
+// The viewer re-emits cleaned lines verbatim, so anything that would move
+// the cursor or reprogram the terminal has to be gone: embedded \r overwrite
+// sequences keep only what a terminal would have shown, and OSC escapes are
+// stripped alongside CSI ones.
+func TestCleanNeutralizesTerminalControl(t *testing.T) {
+	for in, want := range map[string]string{
+		"10%\r50%\r100%":                             "100%",
+		"progress\r\n":                               "progress",
+		"\x1b]0;title\x07after":                      "after",
+		"\x1b]8;;https://x\x1b\\link":                "link",
+		"\x1b[2Kplain\x1b[1;31m red\x1b[0m":          "plain red",
+		"mixed\rfinal \x1b]0;t\x07\x1b[32mok\x1b[0m": "final ok",
+	} {
+		if got := Clean(in); got != want {
+			t.Errorf("Clean(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
 func TestRealStreamsOutputAndExit(t *testing.T) {
 	ch := (&Real{}).Start(context.Background(), Spec{
 		Argv: []string{"sh", "-c", `printf 'one\n\x1b[1;36mtwo\x1b[0m\n'; echo err >&2`},

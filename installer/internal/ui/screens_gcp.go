@@ -299,7 +299,9 @@ func (s *clusterScreen) Hints() []Hint {
 		return []Hint{{"enter", "create with this name"}, {"esc", "back to list"}}
 	case "probing":
 		if s.comp != nil && s.comp.failed != nil {
-			return []Hint{{"v", "view log"}, {"r", "retry"}, {"y", "continue without the check"}, {"esc", "back to list"}}
+			// No explicit "v" hint: bottomView appends it whenever the comp
+		// has output, and a second copy overflows narrow bottom bars.
+		return []Hint{{"r", "retry"}, {"y", "continue without the check"}, {"esc", "back to list"}}
 		}
 		return []Hint{{"esc", "cancel"}}
 	case "installed":

@@ -164,9 +164,7 @@ func (a *App) exitView(w int) string {
 	return theme.ErrorPanel.Width(min(w-2, 64)).Render(msg)
 }
 
-// clampHeight truncates rendered content to at most h lines. If the content
-// contains an error or failure notification, the bottom lines (the error panel
-// and recent logs) are preserved instead of being cut off.
+// clampHeight truncates rendered content to at most h lines, keeping the top.
 func clampHeight(s string, h int) string {
 	if h <= 0 {
 		return s
@@ -175,15 +173,30 @@ func clampHeight(s string, h int) string {
 	if len(lines) <= h {
 		return s
 	}
-	hasError := false
-	for i := len(lines) - 1; i >= 0; i-- {
-		if strings.Contains(lines[i], "Command failed: ") || strings.Contains(lines[i], "Command failed") {
-			hasError = true
-			break
-		}
+	return strings.Join(lines[:h], "\n")
+}
+
+// clampHeightAroundFailure clamps overflowing content to the window that
+// keeps the failure banner and what follows it — the cause, the [v]/[r]
+// guidance, the log path — on screen. The window starts at the banner
+// (guidance below beats context above), sliding up only when the banner is
+// close enough to the bottom to leave the window short. The caller decides
+// when to use it off the component's own failed state; bottom-anchoring
+// unconditionally would drop the banner whenever the tail panel below it is
+// taller than the window.
+func clampHeightAroundFailure(s string, h int) string {
+	if h <= 0 {
+		return s
 	}
-	if hasError {
-		return strings.Join(lines[len(lines)-h:], "\n")
+	lines := strings.Split(s, "\n")
+	if len(lines) <= h {
+		return s
+	}
+	for i, l := range lines {
+		if strings.Contains(l, "Command failed") {
+			start := min(i, len(lines)-h)
+			return strings.Join(lines[start:start+h], "\n")
+		}
 	}
 	return strings.Join(lines[:h], "\n")
 }

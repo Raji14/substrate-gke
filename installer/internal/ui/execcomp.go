@@ -17,6 +17,7 @@ package ui
 import (
 	"context"
 	"fmt"
+	"regexp"
 	"strings"
 	"time"
 
@@ -59,13 +60,6 @@ func newExecComp(runner execx.Runner, spec execx.Spec, items []steps.ChecklistIt
 	return &execComp{runner: runner, spec: spec, items: items, logPath: logPath, active: -1}
 }
 
-func (c *execComp) withLogPath(path string) *execComp {
-	if c != nil {
-		c.logPath = path
-	}
-	return c
-}
-
 func (c *execComp) LogLines() []string {
 	if c == nil {
 		return nil
@@ -80,24 +74,13 @@ func (c *execComp) LogTitle() string {
 	return c.spec.Display
 }
 
-var strongErrKeywords = []string{
-	"error:", "Error:", "ERROR:", "[ERROR]",
-	"fatal:", "Fatal:", "FATAL:",
-	"denied", "forbidden", "Forbidden",
-	"Unauthorized", "unauthorized",
-	"NotFound", "does not exist",
-	"timed out", "timeout", "deadline exceeded",
-}
+// causeLine matches diagnostic vocabulary on word boundaries, so an echoed
+// `kubectl wait --timeout=600s` or a healthy `0 errors, 0 warnings` summary
+// is not promoted to the displayed cause. Bare "timeout" is deliberately
+// absent — it matches inside every --timeout flag.
+var causeLine = regexp.MustCompile(`(?i)\b(error|fatal|failed|failure|denied|forbidden|unauthorized|refused|notfound|not found|does not exist|timed out|deadline exceeded)\b`)
 
-func lineMatchesError(line string) bool {
-	lower := strings.ToLower(line)
-	for _, kw := range strongErrKeywords {
-		if strings.Contains(lower, strings.ToLower(kw)) {
-			return true
-		}
-	}
-	return false
-}
+func lineMatchesError(line string) bool { return causeLine.MatchString(line) }
 
 func extractCause(stderr, allLines []string) string {
 	// First check recent stderr lines (up to 30) for clear error diagnostics
@@ -138,10 +121,6 @@ func extractCause(stderr, allLines []string) string {
 		return lastStderr
 	}
 	return ""
-}
-
-func findErrorSnippet(lines []string) string {
-	return extractCause(nil, lines)
 }
 
 func (c *execComp) start() tea.Cmd {
@@ -260,12 +239,10 @@ func (c *execComp) view(w int) string {
 	if c.failed != nil {
 		var panel strings.Builder
 		panel.WriteString(theme.Bad.Render("Command failed: ") + c.failed.Error())
-		cause := c.cause
-		if cause == "" {
-			cause = findErrorSnippet(c.lines)
-		}
-		if cause != "" && cause != c.failed.Error() {
-			panel.WriteString("\n\n" + theme.Warning.Render("Cause: ") + theme.Subtle.Render(cause))
+		// c.cause was extracted once when the failure landed; rescanning
+		// the 5000-line buffer here would run on every frame.
+		if c.cause != "" && c.cause != c.failed.Error() {
+			panel.WriteString("\n\n" + theme.Warning.Render("Cause: ") + theme.Subtle.Render(c.cause))
 		}
 		panel.WriteString("\n\n" + theme.Subtle.Render("Press ") + theme.Key.Render("[v]") + theme.Subtle.Render(" to view full log, ") + theme.Key.Render("[r]") + theme.Subtle.Render(" to retry."))
 		if c.logPath != "" {
@@ -278,17 +255,20 @@ func (c *execComp) view(w int) string {
 		lw := max(w-8, 20)
 		var visualRows []string
 		for i := len(c.lines) - 1; i >= 0 && len(visualRows) < logTail; i-- {
-			line := c.lines[i]
-			if len(line) <= lw {
-				visualRows = append([]string{line}, visualRows...)
+			// Chunk by runes, not bytes: every over-long line ends in a
+			// multi-byte '…' from Clean, and a byte cut mid-rune renders
+			// U+FFFD garbage on adjacent rows.
+			runes := []rune(c.lines[i])
+			if len(runes) <= lw {
+				visualRows = append([]string{string(runes)}, visualRows...)
 			} else {
 				var chunks []string
-				for len(line) > lw {
-					chunks = append(chunks, line[:lw])
-					line = line[lw:]
+				for len(runes) > lw {
+					chunks = append(chunks, string(runes[:lw]))
+					runes = runes[lw:]
 				}
-				if len(line) > 0 {
-					chunks = append(chunks, line)
+				if len(runes) > 0 {
+					chunks = append(chunks, string(runes))
 				}
 				needed := logTail - len(visualRows)
 				if len(chunks) > needed {

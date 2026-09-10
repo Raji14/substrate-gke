@@ -115,8 +115,6 @@ func TestProbeClusterFailsWhenKubectlFails(t *testing.T) {
 }
 
 func TestCheckInstalled(t *testing.T) {
-	st := testSetup(t)
-
 	// Clean cluster
 	probe, err := ParseInstalled([]string{installedMarker + "false"})
 	if err != nil || probe.Installed {
@@ -129,10 +127,10 @@ func TestCheckInstalled(t *testing.T) {
 		t.Fatalf("ParseInstalled(true with versions) = %+v, %v", probe, err)
 	}
 
-	// Installed without versions (e.g. namespace exists only)
+	// Installed without versions: an interrupted install, not a running one.
 	probe, err = ParseInstalled([]string{installedMarker + "true"})
-	if err != nil || !probe.Installed || len(probe.Versions) != 0 {
-		t.Fatalf("ParseInstalled(true bare) = %+v, %v", probe, err)
+	if err != nil || !probe.Installed || !probe.Partial() {
+		t.Fatalf("ParseInstalled(true bare) = %+v, %v; want partial", probe, err)
 	}
 
 	// Missing marker
@@ -141,15 +139,23 @@ func TestCheckInstalled(t *testing.T) {
 	}
 
 	// Dry run replays false
-	if p, err := ParseInstalled(CheckInstalled(st, false).SimLines); err != nil || p.Installed {
+	if p, err := ParseInstalled(CheckInstalled("acme", "substrate-test", "us-west1-c").SimLines); err != nil || p.Installed {
 		t.Fatalf("dry-run check installed = %+v, %v; want not installed", p, err)
 	}
 
-	for _, credentials := range []bool{true, false} {
-		spec := CheckInstalled(st, credentials)
-		if err := exec.Command("bash", "-n", "-c", spec.Argv[len(spec.Argv)-1]).Run(); err != nil {
-			t.Errorf("CheckInstalled(credentials=%v) is not valid shell: %v", credentials, err)
-		}
+	spec := CheckInstalled("acme", "substrate-test", "us-west1-c")
+	script := spec.Argv[len(spec.Argv)-1]
+	if err := exec.Command("bash", "-n", "-c", script).Run(); err != nil {
+		t.Errorf("CheckInstalled is not valid shell: %v", err)
+	}
+	// The probe must not rewrite the user's kubeconfig just for browsing
+	// clusters, and must not swallow a failing DaemonSet query into a
+	// bare-namespace answer.
+	if !strings.Contains(script, `KUBECONFIG=$(mktemp)`) {
+		t.Errorf("probe does not isolate its kubeconfig:\n%s", script)
+	}
+	if strings.Contains(script, "|| true") {
+		t.Errorf("probe swallows kubectl failures:\n%s", script)
 	}
 }
 
@@ -159,7 +165,12 @@ func TestCheckInstalledFailsWhenKubectlFails(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(bin, "kubectl"), []byte(fake), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	spec := CheckInstalled(testSetup(t), false)
+	// The check always fetches credentials; a gcloud that succeeds without
+	// touching anything lets the script reach the failing kubectl.
+	if err := os.WriteFile(filepath.Join(bin, "gcloud"), []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	spec := CheckInstalled("acme", "substrate-test", "us-west1-c")
 	cmd := exec.Command(spec.Argv[0], spec.Argv[1:]...)
 	cmd.Env = append(os.Environ(), "PATH="+bin+string(os.PathListSeparator)+os.Getenv("PATH"))
 	out, err := cmd.CombinedOutput()

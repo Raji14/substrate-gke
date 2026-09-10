@@ -207,7 +207,5 @@ func printSummary(app *ui.App, deps *ui.Deps, cleaned bool) {
 // cleanupCommand renders the tools/cleanup-gcp invocation for this install.
 // Quoted for pasting, like the teardown command.
 func cleanupCommand(st *state.Setup) string {
-	return fmt.Sprintf("./tools/cleanup-gcp --project %s --cluster %s --location %s --bucket %s",
-		snapshot.ShellQuote(st.ProjectID), snapshot.ShellQuote(st.ClusterName),
-		snapshot.ShellQuote(st.Zone), snapshot.ShellQuote(st.BucketName))
+	return snapshot.CleanupCommand(st.ProjectID, st.ClusterName, st.Zone, st.BucketName)
 }

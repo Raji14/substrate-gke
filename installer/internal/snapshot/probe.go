@@ -40,12 +40,63 @@ func (b *Builder) SubstrateVersion(st *state.Setup) string {
 	return b.Version
 }
 
-// The three lines ProbeCluster prints for ParseProbe.
+// The lines ProbeCluster and CheckInstalled print for ParseProbe and ParseInstalled.
 const (
-	versionsMarker = "SUBSTRATE_GKE_VERSIONS "
-	imageMarker    = "SUBSTRATE_GKE_IMAGE "
-	buildMarker    = "SUBSTRATE_GKE_BUILD "
+	versionsMarker  = "SUBSTRATE_GKE_VERSIONS "
+	imageMarker     = "SUBSTRATE_GKE_IMAGE "
+	buildMarker     = "SUBSTRATE_GKE_BUILD "
+	installedMarker = "SUBSTRATE_GKE_INSTALLED "
 )
+
+// InstalledProbe is what CheckInstalled found.
+type InstalledProbe struct {
+	Installed bool
+	Versions  []string
+}
+
+// CheckInstalled returns the command that probes whether a cluster already
+// runs Substrate: it checks whether the ate-system namespace exists, and if
+// so, what atelet versions it runs.
+func CheckInstalled(st *state.Setup, credentials bool) execx.Spec {
+	lines := []string{"set -euo pipefail"}
+	display := "kubectl get namespace ate-system"
+	if credentials {
+		lines = append(lines, fmt.Sprintf("gcloud container clusters get-credentials %s --location %s --project %s >/dev/null",
+			ShellQuote(st.ClusterName), ShellQuote(st.Zone), ShellQuote(st.ProjectID)))
+		display = "gcloud container clusters get-credentials " + st.ClusterName + " && " + display
+	}
+	lines = append(lines,
+		`ns=$(kubectl get namespace ate-system --ignore-not-found -o jsonpath='{.metadata.name}')`,
+		`if [ -n "$ns" ]; then`,
+		`  versions=$(kubectl -n ate-system get daemonsets -l app=atelet -o jsonpath='{range .items[*]}{.metadata.labels.ate\.dev/substrate-version} {end}' 2>/dev/null || true)`,
+		fmt.Sprintf(`  echo "%strue $versions"`, installedMarker),
+		`else`,
+		fmt.Sprintf(`  echo "%sfalse"`, installedMarker),
+		`fi`,
+	)
+	return execx.Spec{
+		Label:   "check for existing Substrate installation",
+		Display: display,
+		Argv:    []string{"bash", "-c", strings.Join(lines, "\n")},
+		SimLines: []string{
+			installedMarker + "false",
+		},
+	}
+}
+
+// ParseInstalled reads what CheckInstalled printed.
+func ParseInstalled(lines []string) (InstalledProbe, error) {
+	for _, line := range lines {
+		if strings.HasPrefix(line, installedMarker) {
+			fields := strings.Fields(strings.TrimPrefix(line, installedMarker))
+			if len(fields) > 0 && fields[0] == "true" {
+				return InstalledProbe{Installed: true, Versions: fields[1:]}, nil
+			}
+			return InstalledProbe{Installed: false}, nil
+		}
+	}
+	return InstalledProbe{}, fmt.Errorf("probe did not report installation status")
+}
 
 // ProbeCluster returns the command that reads a cluster's running Substrate
 // versions, the image its API server runs and what that binary says it was

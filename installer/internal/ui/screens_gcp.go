@@ -23,6 +23,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 
 	"github.com/ai-on-gke/substrate-gke/installer/internal/gcp"
+	"github.com/ai-on-gke/substrate-gke/installer/internal/snapshot"
 	"github.com/ai-on-gke/substrate-gke/installer/internal/state"
 	"github.com/ai-on-gke/substrate-gke/installer/internal/theme"
 )
@@ -258,10 +259,14 @@ type clusterScreen struct {
 	err      error
 	clusters []gcp.Cluster
 	cursor   int
-	// mode: "list", "name" (new-cluster name input), "confirm" (incompatible
-	// cluster chosen).
-	mode      string
-	nameInput textinput.Model
+	// mode: "list", "name" (new-cluster name input), "probing" (checking
+	// cluster for existing install), "installed" (cluster already runs Substrate),
+	// "confirm" (incompatible cluster chosen).
+	mode              string
+	nameInput         textinput.Model
+	comp              *execComp
+	parsed            bool
+	installedVersions []string
 }
 
 func newClusterScreen(deps *Deps) *clusterScreen {
@@ -286,6 +291,13 @@ func (s *clusterScreen) Hints() []Hint {
 	switch s.mode {
 	case "name":
 		return []Hint{{"enter", "create with this name"}, {"esc", "back to list"}}
+	case "probing":
+		if s.comp != nil && s.comp.failed != nil {
+			return []Hint{{"r", "retry"}, {"esc", "back to list"}}
+		}
+		return []Hint{{"esc", "cancel"}}
+	case "installed":
+		return []Hint{{"r", "re-probe"}, {"esc", "choose another"}}
 	case "confirm":
 		return []Hint{{"y", "use it anyway"}, {"esc", "choose another"}}
 	}
@@ -304,7 +316,42 @@ func (s *clusterScreen) choose(c gcp.Cluster) tea.Cmd {
 	return goNext
 }
 
+func (s *clusterScreen) probeDone() tea.Cmd {
+	res, err := snapshot.ParseInstalled(s.comp.lines)
+	if err != nil {
+		s.comp.failed = err
+		return nil
+	}
+	if res.Installed {
+		s.mode = "installed"
+		s.installedVersions = res.Versions
+		return nil
+	}
+	sel := s.clusters[s.cursor]
+	if !sel.SubstrateReady() {
+		s.mode = "confirm"
+		return nil
+	}
+	return s.choose(sel)
+}
+
+func (s *clusterScreen) Stop() {
+	if s.comp != nil {
+		s.comp.stop()
+	}
+}
+
 func (s *clusterScreen) Update(msg tea.Msg) tea.Cmd {
+	if s.comp != nil {
+		if cmd, handled := s.comp.update(msg); handled {
+			if s.comp.ok() && s.mode == "probing" && !s.parsed {
+				s.parsed = true
+				return s.probeDone()
+			}
+			return cmd
+		}
+	}
+
 	switch m := msg.(type) {
 	case clustersMsg:
 		if m.owner != s {
@@ -341,6 +388,35 @@ func (s *clusterScreen) Update(msg tea.Msg) tea.Cmd {
 			s.nameInput, cmd = s.nameInput.Update(msg)
 			return cmd
 
+		case "probing":
+			switch key {
+			case "r":
+				if s.comp != nil && s.comp.failed != nil {
+					s.parsed = false
+					return s.comp.restart()
+				}
+			case "b", "esc":
+				if s.comp != nil {
+					s.comp.stop()
+				}
+				s.mode = "list"
+				return nil
+			}
+			return nil
+
+		case "installed":
+			switch key {
+			case "r":
+				if s.comp != nil {
+					s.mode, s.parsed = "probing", false
+					return s.comp.restart()
+				}
+			case "b", "esc":
+				s.mode = "list"
+				return nil
+			}
+			return nil
+
 		case "confirm":
 			if key == "y" {
 				return s.choose(s.clusters[s.cursor])
@@ -372,11 +448,17 @@ func (s *clusterScreen) Update(msg tea.Msg) tea.Cmd {
 				return tea.Batch(s.nameInput.Focus(), textinput.Blink)
 			}
 			sel := s.clusters[s.cursor]
-			if !sel.SubstrateReady() {
-				s.mode = "confirm"
+			st := s.deps.Setup
+			st.ClusterName = sel.Name
+			st.Zone = sel.Location
+			st.ClusterIsNew = false
+			if err := st.ApplyProjectDefaults(); err != nil {
+				s.err = err
 				return nil
 			}
-			return s.choose(sel)
+			s.mode, s.parsed = "probing", false
+			s.comp = newExecComp(s.deps.Runner, snapshot.CheckInstalled(st, true), nil)
+			return s.comp.start()
 		default:
 			// number keys jump: 1..9 select row, matching the prototype.
 			if len(key) == 1 && key[0] >= '1' && key[0] <= '9' {
@@ -428,6 +510,30 @@ func (s *clusterScreen) View(w int) string {
 		b.WriteString("\n" + theme.AccentPanel.Width(min(w-4, 60)).Render(
 			theme.Title.Render("New cluster name")+"\n"+s.nameInput.View()+"\n"+
 				theme.Subtle.Render("Created in "+s.deps.Setup.Zone+" by setup-gcp in the next step.")))
+	case "probing":
+		b.WriteString("\n" + theme.Subtle.Render(fmt.Sprintf("Checking %s for existing Substrate installation…", s.deps.Setup.ClusterName)) + "\n\n")
+		b.WriteString(s.comp.view(w))
+	case "installed":
+		st := s.deps.Setup
+		var verStr string
+		if len(s.installedVersions) > 0 {
+			verStr = fmt.Sprintf(" (version: %s)", strings.Join(s.installedVersions, ", "))
+		}
+		b.WriteString("\n" + theme.ErrorPanel.Width(min(w-4, 76)).Render(
+			theme.Bad.Render(fmt.Sprintf("Cluster %q already runs Substrate%s.", st.ClusterName, verStr))+"\n\n"+
+				"Re-running the install track against an installed cluster is unsupported\n"+
+				"and produces a broken, mixed-version cluster:\n"+
+				"  • Control plane deployments roll to the new commit immediately.\n"+
+				"  • atelet and worker pools remain pinned to the older version,\n"+
+				"    causing router contract mismatches (e.g. 421 Misdirected Request).\n\n"+
+				theme.Title.Render("Supported paths forward:")+"\n"+
+				"  1. Upgrade this cluster: exit or restart the installer and choose\n"+
+				"     \"Upgrade an installed cluster\" to follow the rolling upgrade runbook.\n\n"+
+				"  2. Teardown and reinstall: tear down the existing deployment first with:\n"+
+				fmt.Sprintf("     ./tools/cleanup-gcp --project %s --cluster %s --location %s --bucket %s\n",
+					st.ProjectID, st.ClusterName, st.Zone, st.BucketName)+
+				"     or delete only the control plane: ate-setup delete ate-system\n\n"+
+				theme.Key.Render("[esc]")+" choose another cluster   "+theme.Key.Render("[r]")+" re-probe"))
 	case "confirm":
 		b.WriteString("\n" + theme.ErrorPanel.Width(min(w-4, 74)).Render(
 			theme.Warning.Render("This cluster cannot run Substrate as-is.")+"\n\n"+

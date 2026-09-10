@@ -912,3 +912,111 @@ func TestBackFromCompleteClearsCompleted(t *testing.T) {
 		t.Errorf("back from Complete: %v completed=%v", app.mach.Current(), app.Completed)
 	}
 }
+
+type installedClusterRunner struct {
+	inner    execx.Runner
+	versions string
+}
+
+func (r installedClusterRunner) Start(ctx context.Context, spec execx.Spec) <-chan execx.Event {
+	if spec.Label == "check for existing Substrate installation" {
+		ch := make(chan execx.Event, 2)
+		ch <- execx.Event{Line: "SUBSTRATE_GKE_INSTALLED true " + r.versions}
+		ch <- execx.Event{Done: true}
+		close(ch)
+		return ch
+	}
+	return r.inner.Start(ctx, spec)
+}
+
+func TestClusterScreenBlocksAlreadyInstalledCluster(t *testing.T) {
+	app := testApp(t)
+	app.deps.Runner = installedClusterRunner{inner: execx.DryRun{Delay: time.Millisecond}, versions: "substrate-71e7623"}
+	pump(t, app, tea.WindowSizeMsg{Width: 120, Height: 40})
+	press := func(keys ...string) {
+		for _, k := range keys {
+			pump(t, app, key(k))
+		}
+	}
+
+	press("enter")                                 // welcome -> doctor
+	press("enter")                                 // doctor -> images
+	press("2", "enter", "enter", "enter", "enter") // release images -> project
+	press("enter", "enter", "enter")               // project -> cluster
+	if app.mach.Current() != state.Cluster {
+		t.Fatalf("after project: %v", app.mach.Current())
+	}
+
+	press("1", "enter") // pick the first cluster (substrate-poc)
+	// Must NOT advance to Provision! Must stay at Cluster and enter "installed" mode
+	if app.mach.Current() != state.Cluster {
+		t.Fatalf("wizard should remain on Cluster step when installed, got: %v", app.mach.Current())
+	}
+	scr := app.cur.(*clusterScreen)
+	if scr.mode != "installed" {
+		t.Fatalf("clusterScreen mode = %q, want %q", scr.mode, "installed")
+	}
+
+	view := app.View()
+	if !strings.Contains(view, "already runs Substrate") || !strings.Contains(view, "substrate-71e7623") {
+		t.Errorf("view missing installed version warning:\n%s", view)
+	}
+	if !strings.Contains(view, "Upgrade an installed cluster") {
+		t.Errorf("view missing upgrade track recommendation:\n%s", view)
+	}
+	if !strings.Contains(view, "cleanup-gcp") {
+		t.Errorf("view missing cleanup-gcp recommendation:\n%s", view)
+	}
+
+	// Pressing esc returns to cluster list
+	pump(t, app, tea.KeyMsg{Type: tea.KeyEsc})
+	if scr.mode != "list" {
+		t.Errorf("after esc: mode = %q, want list", scr.mode)
+	}
+}
+
+type probeFailRunner struct {
+	inner execx.Runner
+}
+
+func (r probeFailRunner) Start(ctx context.Context, spec execx.Spec) <-chan execx.Event {
+	if spec.Label == "check for existing Substrate installation" {
+		ch := make(chan execx.Event, 1)
+		ch <- execx.Event{Done: true, Err: errors.New("error: Unauthorized")}
+		close(ch)
+		return ch
+	}
+	return r.inner.Start(ctx, spec)
+}
+
+func TestClusterScreenProbeFails(t *testing.T) {
+	app := testApp(t)
+	app.deps.Runner = probeFailRunner{inner: execx.DryRun{Delay: time.Millisecond}}
+	pump(t, app, tea.WindowSizeMsg{Width: 120, Height: 40})
+	press := func(keys ...string) {
+		for _, k := range keys {
+			pump(t, app, key(k))
+		}
+	}
+
+	press("enter", "enter", "2", "enter", "enter", "enter", "enter", "enter", "enter", "enter")
+	if app.mach.Current() != state.Cluster {
+		t.Fatalf("after project: %v", app.mach.Current())
+	}
+
+	press("1", "enter")
+	scr := app.cur.(*clusterScreen)
+	if scr.mode != "probing" || scr.comp.failed == nil {
+		t.Fatalf("probe should have failed: mode=%s failed=%v", scr.mode, scr.comp.failed)
+	}
+	view := app.View()
+	if !strings.Contains(view, "Command failed") || !strings.Contains(view, "Unauthorized") {
+		t.Errorf("view missing failure message:\n%s", view)
+	}
+
+	// esc returns to list
+	pump(t, app, tea.KeyMsg{Type: tea.KeyEsc})
+	if scr.mode != "list" {
+		t.Errorf("after esc: mode = %q, want list", scr.mode)
+	}
+}

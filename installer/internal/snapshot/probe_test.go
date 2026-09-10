@@ -114,6 +114,63 @@ func TestProbeClusterFailsWhenKubectlFails(t *testing.T) {
 	}
 }
 
+func TestCheckInstalled(t *testing.T) {
+	st := testSetup(t)
+
+	// Clean cluster
+	probe, err := ParseInstalled([]string{installedMarker + "false"})
+	if err != nil || probe.Installed {
+		t.Fatalf("ParseInstalled(false) = %+v, %v; want Installed: false", probe, err)
+	}
+
+	// Installed with versions
+	probe, err = ParseInstalled([]string{installedMarker + "true substrate-71e7623 substrate-0b3d2d0"})
+	if err != nil || !probe.Installed || len(probe.Versions) != 2 || probe.Versions[0] != "substrate-71e7623" || probe.Versions[1] != "substrate-0b3d2d0" {
+		t.Fatalf("ParseInstalled(true with versions) = %+v, %v", probe, err)
+	}
+
+	// Installed without versions (e.g. namespace exists only)
+	probe, err = ParseInstalled([]string{installedMarker + "true"})
+	if err != nil || !probe.Installed || len(probe.Versions) != 0 {
+		t.Fatalf("ParseInstalled(true bare) = %+v, %v", probe, err)
+	}
+
+	// Missing marker
+	if _, err := ParseInstalled([]string{"something else"}); err == nil {
+		t.Error("ParseInstalled should fail when marker is missing")
+	}
+
+	// Dry run replays false
+	if p, err := ParseInstalled(CheckInstalled(st, false).SimLines); err != nil || p.Installed {
+		t.Fatalf("dry-run check installed = %+v, %v; want not installed", p, err)
+	}
+
+	for _, credentials := range []bool{true, false} {
+		spec := CheckInstalled(st, credentials)
+		if err := exec.Command("bash", "-n", "-c", spec.Argv[len(spec.Argv)-1]).Run(); err != nil {
+			t.Errorf("CheckInstalled(credentials=%v) is not valid shell: %v", credentials, err)
+		}
+	}
+}
+
+func TestCheckInstalledFailsWhenKubectlFails(t *testing.T) {
+	bin := t.TempDir()
+	fake := "#!/bin/sh\necho 'error: You must be logged in to the server (Unauthorized)' >&2\nexit 1\n"
+	if err := os.WriteFile(filepath.Join(bin, "kubectl"), []byte(fake), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	spec := CheckInstalled(testSetup(t), false)
+	cmd := exec.Command(spec.Argv[0], spec.Argv[1:]...)
+	cmd.Env = append(os.Environ(), "PATH="+bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("CheckInstalled should fail when kubectl fails:\n%s", out)
+	}
+	if !strings.Contains(string(out), "Unauthorized") || strings.Contains(string(out), installedMarker) {
+		t.Errorf("CheckInstalled should show kubectl's error and no markers:\n%s", out)
+	}
+}
+
 // The probe reads one image, the API server's; the version it pairs with
 // is the one chosen, which mid-upgrade may be the other running one, and
 // which a digest-only reference does not name at all.

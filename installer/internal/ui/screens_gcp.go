@@ -372,8 +372,7 @@ func (s *clusterScreen) probeDone() tea.Cmd {
 func (s *clusterScreen) reprobe() tea.Cmd {
 	c := s.clusters[s.cursor]
 	delete(s.probed, c.Name+"/"+c.Location)
-	s.mode, s.parsed = "probing", false
-	return s.comp.restart()
+	return s.probe(c)
 }
 
 func (s *clusterScreen) Stop() {
@@ -465,9 +464,7 @@ func (s *clusterScreen) Update(msg tea.Msg) tea.Cmd {
 		case "installed", "partial":
 			switch key {
 			case "r":
-				if s.comp != nil {
-					return s.reprobe()
-				}
+				return s.reprobe()
 			case "y":
 				if s.mode == "partial" {
 					return s.decide(s.clusters[s.cursor], snapshot.InstalledProbe{})

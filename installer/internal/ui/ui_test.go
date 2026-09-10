@@ -997,6 +997,11 @@ func TestClusterScreenBlocksAlreadyInstalledCluster(t *testing.T) {
 	if scr.mode != "installed" || calls != 1 {
 		t.Errorf("re-selection: mode=%q probes=%d, want installed from cache after 1 probe", scr.mode, calls)
 	}
+	// Pressing 'r' invalidates the cache and re-probes.
+	press("r")
+	if scr.mode != "installed" || calls != 2 {
+		t.Errorf("re-probe: mode=%q probes=%d, want installed after 2 probes", scr.mode, calls)
+	}
 }
 
 // Typing an installed cluster's name into "Create a new cluster" must hit

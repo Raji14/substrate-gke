@@ -956,6 +956,11 @@ func TestClusterScreenBlocksAlreadyInstalledCluster(t *testing.T) {
 	calls := 0
 	app.deps.Runner = installedClusterRunner{inner: execx.DryRun{Delay: time.Millisecond}, versions: "substrate-71e7623", calls: &calls}
 	press := pressToCluster(t, app)
+	// The list load already background-probed the one substrate-ready
+	// cluster; legacy-prod is not ready, so selecting it probes fresh.
+	if calls != 1 {
+		t.Fatalf("background probes on load = %d, want 1", calls)
+	}
 
 	press("2", "enter") // pick legacy-prod (us-central1)
 	// Must NOT advance to Provision! Must stay at Cluster and enter "installed" mode
@@ -998,13 +1003,31 @@ func TestClusterScreenBlocksAlreadyInstalledCluster(t *testing.T) {
 	// Re-selecting the same cluster answers from the cache instead of paying
 	// another gcloud+kubectl round trip.
 	press("enter")
-	if scr.mode != "installed" || calls != 1 {
-		t.Errorf("re-selection: mode=%q probes=%d, want installed from cache after 1 probe", scr.mode, calls)
+	if scr.mode != "installed" || calls != 2 {
+		t.Errorf("re-selection: mode=%q probes=%d, want installed from cache after 2 probes", scr.mode, calls)
 	}
 	// Pressing 'r' invalidates the cache and re-probes.
 	press("r")
-	if scr.mode != "installed" || calls != 2 {
-		t.Errorf("re-probe: mode=%q probes=%d, want installed after 2 probes", scr.mode, calls)
+	if scr.mode != "installed" || calls != 3 {
+		t.Errorf("re-probe: mode=%q probes=%d, want installed after 3 probes", scr.mode, calls)
+	}
+}
+
+// The list learns install state on its own: substrate-ready clusters are
+// probed in the background as the list loads, so their rows carry a badge
+// without the user selecting anything. Not-ready clusters are skipped —
+// they cannot take an install, so their state decides nothing.
+func TestListBackgroundProbesReadyClusters(t *testing.T) {
+	app := testApp(t)
+	calls := 0
+	app.deps.Runner = installedClusterRunner{inner: execx.DryRun{Delay: time.Millisecond}, versions: "substrate-0b3d2d078f64", calls: &calls}
+	pressToCluster(t, app)
+
+	if calls != 1 {
+		t.Fatalf("background probes = %d, want 1 (only the substrate-ready cluster)", calls)
+	}
+	if view := app.View(); !strings.Contains(view, "substrate installed") {
+		t.Errorf("list row missing the background-probed badge:\n%s", view)
 	}
 }
 

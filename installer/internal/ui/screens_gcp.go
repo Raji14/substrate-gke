@@ -272,6 +272,10 @@ type clusterScreen struct {
 	// probed caches results per cluster, so browsing back and forth does not
 	// pay the multi-second gcloud+kubectl round trip again. [r] re-probes.
 	probed map[string]snapshot.InstalledProbe
+	// bgPending marks clusters whose background probe is still in flight,
+	// rendered as a "checking" note on the row until the result (or a
+	// silent failure) lands.
+	bgPending map[string]bool
 }
 
 func newClusterScreen(deps *Deps) *clusterScreen {
@@ -280,7 +284,51 @@ func newClusterScreen(deps *Deps) *clusterScreen {
 	in.CharLimit = 40
 	in.Prompt = "  "
 	return &clusterScreen{deps: deps, loading: true, mode: "list", nameInput: in,
-		probed: map[string]snapshot.InstalledProbe{}}
+		probed: map[string]snapshot.InstalledProbe{}, bgPending: map[string]bool{}}
+}
+
+// bgProbeMsg carries one background probe's verdict back to its screen.
+type bgProbeMsg struct {
+	owner *clusterScreen
+	key   string
+	res   snapshot.InstalledProbe
+	err   error
+}
+
+// bgProbes probes the substrate-ready clusters in the background, one
+// command per cluster so they run concurrently: the list renders
+// immediately and each row picks up its install badge as its result lands.
+// Only ready clusters — the others cannot take an install, so their state
+// decides nothing — and a probe that fails (say, kubectl cannot reach the
+// cluster) just leaves its row unbadged; selecting it still runs the
+// foreground probe with its retry and continue-anyway paths.
+func (s *clusterScreen) bgProbes() tea.Cmd {
+	var cmds []tea.Cmd
+	for _, c := range s.clusters {
+		key := c.Name + "/" + c.Location
+		if !c.SubstrateReady() || s.bgPending[key] {
+			continue
+		}
+		if _, ok := s.probed[key]; ok {
+			continue
+		}
+		s.bgPending[key] = true
+		spec := snapshot.CheckInstalled(s.deps.Setup.ProjectID, c.Name, c.Location)
+		cmds = append(cmds, func() tea.Msg {
+			var lines []string
+			for ev := range s.deps.Runner.Start(context.Background(), spec) {
+				if ev.Line != "" {
+					lines = append(lines, ev.Line)
+				}
+				if ev.Done && ev.Err != nil {
+					return bgProbeMsg{owner: s, key: key, err: ev.Err}
+				}
+			}
+			res, err := snapshot.ParseInstalled(lines)
+			return bgProbeMsg{owner: s, key: key, res: res, err: err}
+		})
+	}
+	return tea.Batch(cmds...)
 }
 
 func (s *clusterScreen) Init() tea.Cmd {
@@ -418,6 +466,17 @@ func (s *clusterScreen) Update(msg tea.Msg) tea.Cmd {
 		s.loading = false
 		s.clusters, s.err = m.clusters, m.err
 		s.cursor = len(s.clusters) // default to "create new"
+		return s.bgProbes()
+
+	case bgProbeMsg:
+		if m.owner != s {
+			return nil
+		}
+		delete(s.bgPending, m.key)
+		// A foreground probe may have landed first; it is at least as fresh.
+		if _, ok := s.probed[m.key]; !ok && m.err == nil {
+			s.probed[m.key] = m.res
+		}
 		return nil
 
 	case tea.KeyMsg:
@@ -602,6 +661,8 @@ func (s *clusterScreen) View(w int) string {
 				label = " · partial install"
 			}
 			badge += theme.Warning.Render(label)
+		} else if s.bgPending[c.Name+"/"+c.Location] {
+			badge += theme.Fainted.Render(" · checking…")
 		}
 		row := fmt.Sprintf("[%d] %-24s %-14s %-18s %2d nodes  %s", i+1, c.Name, c.Location, c.MasterVersion, c.NodeCount, badge)
 		if i == s.cursor {

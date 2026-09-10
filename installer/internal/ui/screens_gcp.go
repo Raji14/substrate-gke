@@ -23,6 +23,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 
 	"github.com/ai-on-gke/substrate-gke/installer/internal/gcp"
+	"github.com/ai-on-gke/substrate-gke/installer/internal/snapshot"
 	"github.com/ai-on-gke/substrate-gke/installer/internal/state"
 	"github.com/ai-on-gke/substrate-gke/installer/internal/theme"
 )
@@ -258,10 +259,18 @@ type clusterScreen struct {
 	err      error
 	clusters []gcp.Cluster
 	cursor   int
-	// mode: "list", "name" (new-cluster name input), "confirm" (incompatible
-	// cluster chosen).
-	mode      string
-	nameInput textinput.Model
+	// mode: "list", "name" (new-cluster name input), "probing" (checking
+	// cluster for existing install), "installed" (cluster already runs
+	// Substrate), "partial" (ate-system namespace without atelet),
+	// "confirm" (incompatible cluster chosen).
+	mode              string
+	nameInput         textinput.Model
+	comp              *execComp
+	parsed            bool
+	installedVersions []string
+	// probed caches results per cluster, so browsing back and forth does not
+	// pay the multi-second gcloud+kubectl round trip again. [r] re-probes.
+	probed map[string]snapshot.InstalledProbe
 }
 
 func newClusterScreen(deps *Deps) *clusterScreen {
@@ -269,7 +278,8 @@ func newClusterScreen(deps *Deps) *clusterScreen {
 	in.SetValue(deps.Setup.ClusterName)
 	in.CharLimit = 40
 	in.Prompt = "  "
-	return &clusterScreen{deps: deps, loading: true, mode: "list", nameInput: in}
+	return &clusterScreen{deps: deps, loading: true, mode: "list", nameInput: in,
+		probed: map[string]snapshot.InstalledProbe{}}
 }
 
 func (s *clusterScreen) Init() tea.Cmd {
@@ -286,12 +296,25 @@ func (s *clusterScreen) Hints() []Hint {
 	switch s.mode {
 	case "name":
 		return []Hint{{"enter", "create with this name"}, {"esc", "back to list"}}
+	case "probing":
+		if s.comp != nil && s.comp.failed != nil {
+			return []Hint{{"r", "retry"}, {"y", "continue without the check"}, {"esc", "back to list"}}
+		}
+		return []Hint{{"esc", "cancel"}}
+	case "installed":
+		return []Hint{{"r", "re-probe"}, {"esc", "choose another"}}
+	case "partial":
+		return []Hint{{"y", "continue"}, {"r", "re-probe"}, {"esc", "choose another"}}
 	case "confirm":
 		return []Hint{{"y", "use it anyway"}, {"esc", "choose another"}}
 	}
 	return []Hint{{"↑/↓", "select"}, {"enter", "confirm"}, {"r", "reload"}, {"b", "back"}}
 }
 
+// choose is the one place a selection reaches Setup. Everything before it —
+// probing included — works off the gcp.Cluster alone, so an aborted
+// selection leaves no zone, name, or derived bucket behind to leak into the
+// create-new path or a later pick.
 func (s *clusterScreen) choose(c gcp.Cluster) tea.Cmd {
 	st := s.deps.Setup
 	st.ClusterName = c.Name
@@ -304,7 +327,71 @@ func (s *clusterScreen) choose(c gcp.Cluster) tea.Cmd {
 	return goNext
 }
 
+// probe checks the selection for an existing install, from cache when the
+// cluster was already probed this visit.
+func (s *clusterScreen) probe(c gcp.Cluster) tea.Cmd {
+	if res, ok := s.probed[c.Name+"/"+c.Location]; ok {
+		return s.decide(c, res)
+	}
+	s.mode, s.parsed = "probing", false
+	s.comp = newExecComp(s.deps.Runner, snapshot.CheckInstalled(s.deps.Setup.ProjectID, c.Name, c.Location), nil)
+	return s.comp.start()
+}
+
+// decide routes a probe result: a running install is blocked, a bare
+// ate-system namespace (an interrupted install — upstream's deploy is
+// documented safe to re-run) asks, and a clean cluster continues through the
+// pre-existing beta-API check.
+func (s *clusterScreen) decide(c gcp.Cluster, res snapshot.InstalledProbe) tea.Cmd {
+	switch {
+	case res.Partial():
+		s.mode = "partial"
+		return nil
+	case res.Installed:
+		s.mode, s.installedVersions = "installed", res.Versions
+		return nil
+	case !c.SubstrateReady():
+		s.mode = "confirm"
+		return nil
+	}
+	return s.choose(c)
+}
+
+func (s *clusterScreen) probeDone() tea.Cmd {
+	res, err := snapshot.ParseInstalled(s.comp.lines)
+	if err != nil {
+		s.comp.failed = err
+		return nil
+	}
+	c := s.clusters[s.cursor]
+	s.probed[c.Name+"/"+c.Location] = res
+	return s.decide(c, res)
+}
+
+// reprobe drops the cached result and runs the check again.
+func (s *clusterScreen) reprobe() tea.Cmd {
+	c := s.clusters[s.cursor]
+	delete(s.probed, c.Name+"/"+c.Location)
+	return s.probe(c)
+}
+
+func (s *clusterScreen) Stop() {
+	if s.comp != nil {
+		s.comp.stop()
+	}
+}
+
 func (s *clusterScreen) Update(msg tea.Msg) tea.Cmd {
+	if s.comp != nil {
+		if cmd, handled := s.comp.update(msg); handled {
+			if s.comp.ok() && s.mode == "probing" && !s.parsed {
+				s.parsed = true
+				return s.probeDone()
+			}
+			return cmd
+		}
+	}
+
 	switch m := msg.(type) {
 	case clustersMsg:
 		if m.owner != s {
@@ -328,6 +415,16 @@ func (s *clusterScreen) Update(msg tea.Msg) tea.Cmd {
 				if name == "" {
 					return nil
 				}
+				// A listed cluster typed by name is still that cluster: it
+				// goes through the same probe as a selection, or the guard
+				// would be one typed name away from the mixed-version
+				// install it exists to prevent.
+				for i, c := range s.clusters {
+					if c.Name == name {
+						s.cursor, s.mode = i, "list"
+						return s.probe(c)
+					}
+				}
 				st := s.deps.Setup
 				st.ClusterName = name
 				st.ClusterIsNew = true
@@ -340,6 +437,43 @@ func (s *clusterScreen) Update(msg tea.Msg) tea.Cmd {
 			var cmd tea.Cmd
 			s.nameInput, cmd = s.nameInput.Update(msg)
 			return cmd
+
+		case "probing":
+			switch key {
+			case "r":
+				if s.comp != nil && s.comp.failed != nil {
+					s.parsed = false
+					return s.comp.restart()
+				}
+			case "y":
+				// The guard is advisory when the cluster cannot be probed —
+				// a private control plane or missing kubectl access must not
+				// make a listed cluster permanently unselectable.
+				if s.comp != nil && s.comp.failed != nil {
+					return s.decide(s.clusters[s.cursor], snapshot.InstalledProbe{})
+				}
+			case "b", "esc":
+				if s.comp != nil {
+					s.comp.stop()
+				}
+				s.mode = "list"
+				return nil
+			}
+			return nil
+
+		case "installed", "partial":
+			switch key {
+			case "r":
+				return s.reprobe()
+			case "y":
+				if s.mode == "partial" {
+					return s.decide(s.clusters[s.cursor], snapshot.InstalledProbe{})
+				}
+			case "b", "esc":
+				s.mode = "list"
+				return nil
+			}
+			return nil
 
 		case "confirm":
 			if key == "y" {
@@ -371,12 +505,7 @@ func (s *clusterScreen) Update(msg tea.Msg) tea.Cmd {
 				s.mode = "name"
 				return tea.Batch(s.nameInput.Focus(), textinput.Blink)
 			}
-			sel := s.clusters[s.cursor]
-			if !sel.SubstrateReady() {
-				s.mode = "confirm"
-				return nil
-			}
-			return s.choose(sel)
+			return s.probe(s.clusters[s.cursor])
 		default:
 			// number keys jump: 1..9 select row, matching the prototype.
 			if len(key) == 1 && key[0] >= '1' && key[0] <= '9' {
@@ -428,6 +557,41 @@ func (s *clusterScreen) View(w int) string {
 		b.WriteString("\n" + theme.AccentPanel.Width(min(w-4, 60)).Render(
 			theme.Title.Render("New cluster name")+"\n"+s.nameInput.View()+"\n"+
 				theme.Subtle.Render("Created in "+s.deps.Setup.Zone+" by setup-gcp in the next step.")))
+	case "probing":
+		sel := s.clusters[s.cursor]
+		b.WriteString("\n" + theme.Subtle.Render(fmt.Sprintf("Checking %s for existing Substrate installation…", sel.Name)) + "\n\n")
+		b.WriteString(s.comp.view(w))
+		if s.comp.failed != nil {
+			b.WriteString("\n" + theme.Subtle.Render("Could not check the cluster. "+theme.Key.Render("[y]")+" continues without the check;\nonly do that for a cluster you know has no Substrate on it."))
+		}
+	case "installed":
+		sel := s.clusters[s.cursor]
+		var verStr string
+		if len(s.installedVersions) > 0 {
+			verStr = fmt.Sprintf(" (version: %s)", strings.Join(s.installedVersions, ", "))
+		}
+		b.WriteString("\n" + theme.ErrorPanel.Width(min(w-4, 88)).Render(
+			theme.Bad.Render(fmt.Sprintf("Cluster %q already runs Substrate%s.", sel.Name, verStr))+"\n\n"+
+				"Re-running the install track against an installed cluster is unsupported\n"+
+				"and produces a broken, mixed-version cluster:\n"+
+				"  • Control plane deployments roll to the new commit immediately.\n"+
+				"  • atelet and worker pools remain pinned to the older version,\n"+
+				"    causing router contract mismatches (e.g. 421 Misdirected Request).\n\n"+
+				theme.Title.Render("Supported paths forward:")+"\n"+
+				"  1. Upgrade this cluster: exit or restart the installer and choose\n"+
+				"     \"Upgrade an installed cluster\" to follow the rolling upgrade runbook.\n\n"+
+				"  2. Teardown and reinstall: tear down the existing deployment first with:\n"+
+				"     "+snapshot.CleanupCommand(s.deps.Setup.ProjectID, sel.Name, sel.Location, "")+"\n"+
+				"     (--bucket: the snapshot bucket that install used)\n\n"+
+				theme.Key.Render("[esc]")+" choose another cluster   "+theme.Key.Render("[r]")+" re-probe"))
+	case "partial":
+		sel := s.clusters[s.cursor]
+		b.WriteString("\n" + theme.ErrorPanel.Width(min(w-4, 76)).Render(
+			theme.Warning.Render(fmt.Sprintf("Cluster %q has an ate-system namespace but no atelet.", sel.Name))+"\n\n"+
+				"That looks like an interrupted install or an unfinished delete, not a\n"+
+				"running Substrate. Re-running the install over it is safe: upstream's\n"+
+				"deploy steps are idempotent.\n\n"+
+				theme.Key.Render("[y]")+" continue   "+theme.Key.Render("[r]")+" re-probe   "+theme.Key.Render("[esc]")+" choose another"))
 	case "confirm":
 		b.WriteString("\n" + theme.ErrorPanel.Width(min(w-4, 74)).Render(
 			theme.Warning.Render("This cluster cannot run Substrate as-is.")+"\n\n"+

@@ -40,12 +40,99 @@ func (b *Builder) SubstrateVersion(st *state.Setup) string {
 	return b.Version
 }
 
-// The three lines ProbeCluster prints for ParseProbe.
+// The lines ProbeCluster and CheckInstalled print for ParseProbe and ParseInstalled.
 const (
-	versionsMarker = "SUBSTRATE_GKE_VERSIONS "
-	imageMarker    = "SUBSTRATE_GKE_IMAGE "
-	buildMarker    = "SUBSTRATE_GKE_BUILD "
+	versionsMarker  = "SUBSTRATE_GKE_VERSIONS "
+	imageMarker     = "SUBSTRATE_GKE_IMAGE "
+	buildMarker     = "SUBSTRATE_GKE_BUILD "
+	installedMarker = "SUBSTRATE_GKE_INSTALLED "
 )
+
+// InstalledProbe is what CheckInstalled found. Installed with no Versions
+// means the ate-system namespace exists but no atelet DaemonSet does: an
+// interrupted or partially deleted install rather than a running one.
+type InstalledProbe struct {
+	Installed bool
+	Versions  []string
+}
+
+// Partial reports the namespace-without-atelet state.
+func (p InstalledProbe) Partial() bool { return p.Installed && len(p.Versions) == 0 }
+
+// ateletVersionsQuery reads the versions the atelet DaemonSets carry. It is
+// the one definition both probes share, so the install guard and the upgrade
+// track cannot drift apart on what "installed" looks like.
+const ateletVersionsQuery = `kubectl -n ate-system get daemonsets -l app=atelet -o jsonpath='{range .items[*]}{.metadata.labels.ate\.dev/substrate-version} {end}'`
+
+// credentialLines fetches kubectl credentials for the named cluster into a
+// throwaway kubeconfig. Probing must not rewrite the user's ambient
+// current-context just for browsing clusters — and with each probe writing
+// its own file, a probe cancelled mid-gcloud cannot retarget the kubectl of
+// a later probe against a different cluster.
+func credentialLines(projectID, cluster, location string) []string {
+	return []string{
+		`export KUBECONFIG=$(mktemp)`,
+		`trap 'rm -f "$KUBECONFIG"' EXIT`,
+		fmt.Sprintf("gcloud container clusters get-credentials %s --location %s --project %s >/dev/null",
+			ShellQuote(cluster), ShellQuote(location), ShellQuote(projectID)),
+	}
+}
+
+// CheckInstalled returns the command that probes whether the named cluster
+// already runs Substrate: it checks whether the ate-system namespace exists,
+// and if so, what atelet versions it runs. It takes the cluster by name
+// rather than from Setup so the wizard can probe a selection before
+// committing anything to its state.
+func CheckInstalled(projectID, cluster, location string) execx.Spec {
+	lines := append([]string{"set -euo pipefail"}, credentialLines(projectID, cluster, location)...)
+	// No fallback on the DaemonSet query: under set -e a kubectl failure
+	// stops the script and surfaces as a probe error, instead of misreading
+	// the cluster as a bare-namespace install.
+	lines = append(lines,
+		`ns=$(kubectl get namespace ate-system --ignore-not-found -o jsonpath='{.metadata.name}')`,
+		`if [ -n "$ns" ]; then`,
+		`  versions=$(`+ateletVersionsQuery+`)`,
+		fmt.Sprintf(`  echo "%strue $versions"`, installedMarker),
+		`else`,
+		fmt.Sprintf(`  echo "%sfalse"`, installedMarker),
+		`fi`,
+	)
+	return execx.Spec{
+		Label:   "check for existing Substrate installation",
+		Display: "gcloud container clusters get-credentials " + cluster + " && kubectl get namespace ate-system",
+		Argv:    []string{"bash", "-c", strings.Join(lines, "\n")},
+		SimLines: []string{
+			installedMarker + "false",
+		},
+	}
+}
+
+// CleanupCommand renders the tools/cleanup-gcp invocation that deletes
+// everything an install created, quoted for pasting. bucket may be empty
+// when the install's bucket is unknown — a cluster this run did not install —
+// leaving a placeholder for the user to fill in.
+func CleanupCommand(projectID, cluster, location, bucket string) string {
+	quoted := "<snapshot-bucket>"
+	if bucket != "" {
+		quoted = ShellQuote(bucket)
+	}
+	return fmt.Sprintf("./tools/cleanup-gcp --project %s --cluster %s --location %s --bucket %s",
+		ShellQuote(projectID), ShellQuote(cluster), ShellQuote(location), quoted)
+}
+
+// ParseInstalled reads what CheckInstalled printed.
+func ParseInstalled(lines []string) (InstalledProbe, error) {
+	for _, line := range lines {
+		if strings.HasPrefix(line, installedMarker) {
+			fields := strings.Fields(strings.TrimPrefix(line, installedMarker))
+			if len(fields) > 0 && fields[0] == "true" {
+				return InstalledProbe{Installed: true, Versions: fields[1:]}, nil
+			}
+			return InstalledProbe{Installed: false}, nil
+		}
+	}
+	return InstalledProbe{}, fmt.Errorf("probe did not report installation status")
+}
 
 // ProbeCluster returns the command that reads a cluster's running Substrate
 // versions, the image its API server runs and what that binary says it was
@@ -55,8 +142,7 @@ func ProbeCluster(st *state.Setup, credentials bool) execx.Spec {
 	lines := []string{"set -euo pipefail"}
 	display := "kubectl -n ate-system get daemonsets,deployments"
 	if credentials {
-		lines = append(lines, fmt.Sprintf("gcloud container clusters get-credentials %s --location %s --project %s >/dev/null",
-			ShellQuote(st.ClusterName), ShellQuote(st.Zone), ShellQuote(st.ProjectID)))
+		lines = append(lines, credentialLines(st.ProjectID, st.ClusterName, st.Zone)...)
 		display = "gcloud container clusters get-credentials " + st.ClusterName + " && " + display
 	}
 	// Assignments rather than substitutions inside echo: a kubectl that
@@ -65,7 +151,7 @@ func ProbeCluster(st *state.Setup, credentials bool) execx.Spec {
 	// The binary's own report is best effort: an image not built by ko
 	// has it somewhere else, and the manual screen covers that.
 	lines = append(lines,
-		`versions=$(kubectl -n ate-system get daemonsets -l app=atelet -o jsonpath='{range .items[*]}{.metadata.labels.ate\.dev/substrate-version} {end}')`,
+		`versions=$(`+ateletVersionsQuery+`)`,
 		`image=$(kubectl -n ate-system get deployment ate-api-server -o jsonpath='{.spec.template.spec.containers[0].image}')`,
 		`build=$(kubectl -n ate-system exec deploy/ate-api-server -- /ko-app/ateapi --version 2>/dev/null || true)`,
 		fmt.Sprintf(`echo "%s$versions"`, versionsMarker),

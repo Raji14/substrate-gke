@@ -912,3 +912,186 @@ func TestBackFromCompleteClearsCompleted(t *testing.T) {
 		t.Errorf("back from Complete: %v completed=%v", app.mach.Current(), app.Completed)
 	}
 }
+
+type installedClusterRunner struct {
+	inner    execx.Runner
+	versions string
+	calls    *int
+}
+
+func (r installedClusterRunner) Start(ctx context.Context, spec execx.Spec) <-chan execx.Event {
+	if spec.Label == "check for existing Substrate installation" {
+		if r.calls != nil {
+			*r.calls++
+		}
+		ch := make(chan execx.Event, 2)
+		ch <- execx.Event{Line: strings.TrimSpace("SUBSTRATE_GKE_INSTALLED true " + r.versions)}
+		ch <- execx.Event{Done: true}
+		close(ch)
+		return ch
+	}
+	return r.inner.Start(ctx, spec)
+}
+
+// pressToCluster walks a fresh app to the cluster screen.
+func pressToCluster(t *testing.T, app *App) func(keys ...string) {
+	t.Helper()
+	pump(t, app, tea.WindowSizeMsg{Width: 120, Height: 40})
+	press := func(keys ...string) {
+		for _, k := range keys {
+			pump(t, app, key(k))
+		}
+	}
+	press("enter")                                 // welcome -> doctor
+	press("enter")                                 // doctor -> images
+	press("2", "enter", "enter", "enter", "enter") // release images -> project
+	press("enter", "enter", "enter")               // project fields -> cluster
+	if app.mach.Current() != state.Cluster {
+		t.Fatalf("after project: %v", app.mach.Current())
+	}
+	return press
+}
+
+func TestClusterScreenBlocksAlreadyInstalledCluster(t *testing.T) {
+	app := testApp(t)
+	calls := 0
+	app.deps.Runner = installedClusterRunner{inner: execx.DryRun{Delay: time.Millisecond}, versions: "substrate-71e7623", calls: &calls}
+	press := pressToCluster(t, app)
+
+	press("2", "enter") // pick legacy-prod (us-central1)
+	// Must NOT advance to Provision! Must stay at Cluster and enter "installed" mode
+	if app.mach.Current() != state.Cluster {
+		t.Fatalf("wizard should remain on Cluster step when installed, got: %v", app.mach.Current())
+	}
+	scr := app.cur.(*clusterScreen)
+	if scr.mode != "installed" {
+		t.Fatalf("clusterScreen mode = %q, want %q", scr.mode, "installed")
+	}
+
+	view := app.View()
+	if !strings.Contains(view, "already runs Substrate") || !strings.Contains(view, "substrate-71e7623") {
+		t.Errorf("view missing installed version warning:\n%s", view)
+	}
+	if !strings.Contains(view, "Upgrade an installed cluster") {
+		t.Errorf("view missing upgrade track recommendation:\n%s", view)
+	}
+	if !strings.Contains(view, "cleanup-gcp") {
+		t.Errorf("view missing cleanup-gcp recommendation:\n%s", view)
+	}
+
+	// Pressing esc returns to cluster list
+	pump(t, app, tea.KeyMsg{Type: tea.KeyEsc})
+	if scr.mode != "list" {
+		t.Errorf("after esc: mode = %q, want list", scr.mode)
+	}
+	// An aborted selection must leave nothing behind: neither the rejected
+	// cluster's name and zone nor a bucket derived from them.
+	st := app.deps.Setup
+	if st.ClusterName != "substrate-test" || st.Zone != "us-west1-c" || st.BucketName != "" {
+		t.Errorf("aborted selection leaked into Setup: cluster=%q zone=%q bucket=%q",
+			st.ClusterName, st.Zone, st.BucketName)
+	}
+	// Re-selecting the same cluster answers from the cache instead of paying
+	// another gcloud+kubectl round trip.
+	press("enter")
+	if scr.mode != "installed" || calls != 1 {
+		t.Errorf("re-selection: mode=%q probes=%d, want installed from cache after 1 probe", scr.mode, calls)
+	}
+	// Pressing 'r' invalidates the cache and re-probes.
+	press("r")
+	if scr.mode != "installed" || calls != 2 {
+		t.Errorf("re-probe: mode=%q probes=%d, want installed after 2 probes", scr.mode, calls)
+	}
+}
+
+// Typing an installed cluster's name into "Create a new cluster" must hit
+// the same guard as selecting it: Bootstrap is idempotent, so an adopted
+// existing cluster would otherwise get the exact mixed-version install the
+// guard exists to prevent.
+func TestTypedInstalledClusterNameIsStillGuarded(t *testing.T) {
+	app := testApp(t)
+	app.deps.Runner = installedClusterRunner{inner: execx.DryRun{Delay: time.Millisecond}, versions: "substrate-71e7623"}
+	press := pressToCluster(t, app)
+
+	press("enter") // cursor defaults to "Create a new cluster" -> name mode
+	scr := app.cur.(*clusterScreen)
+	if scr.mode != "name" {
+		t.Fatalf("mode = %q, want name", scr.mode)
+	}
+	scr.nameInput.SetValue("legacy-prod")
+	press("enter")
+	if app.mach.Current() != state.Cluster || scr.mode != "installed" {
+		t.Fatalf("typed installed cluster: step=%v mode=%q, want Cluster/installed", app.mach.Current(), scr.mode)
+	}
+	if app.deps.Setup.ClusterName != "substrate-test" || app.deps.Setup.ClusterIsNew {
+		t.Errorf("blocked name leaked into Setup: %q (new=%v)", app.deps.Setup.ClusterName, app.deps.Setup.ClusterIsNew)
+	}
+}
+
+// A bare ate-system namespace with no atelet is an interrupted install, not
+// a running one; upstream's deploy is documented idempotent, so the screen
+// asks instead of hard-blocking with teardown as the only exit.
+func TestPartialInstallOffersContinue(t *testing.T) {
+	app := testApp(t)
+	app.deps.Runner = installedClusterRunner{inner: execx.DryRun{Delay: time.Millisecond}}
+	press := pressToCluster(t, app)
+
+	press("1", "enter") // substrate-poc, namespace only
+	scr := app.cur.(*clusterScreen)
+	if scr.mode != "partial" {
+		t.Fatalf("mode = %q, want partial", scr.mode)
+	}
+	if view := app.View(); !strings.Contains(view, "no atelet") {
+		t.Errorf("view missing partial-install explanation:\n%s", view)
+	}
+	press("y")
+	if app.mach.Current() != state.Provision || app.deps.Setup.ClusterName != "substrate-poc" {
+		t.Errorf("continue: step=%v cluster=%q, want Provision/substrate-poc",
+			app.mach.Current(), app.deps.Setup.ClusterName)
+	}
+}
+
+type probeFailRunner struct {
+	inner execx.Runner
+}
+
+func (r probeFailRunner) Start(ctx context.Context, spec execx.Spec) <-chan execx.Event {
+	if spec.Label == "check for existing Substrate installation" {
+		ch := make(chan execx.Event, 1)
+		ch <- execx.Event{Done: true, Err: errors.New("error: Unauthorized")}
+		close(ch)
+		return ch
+	}
+	return r.inner.Start(ctx, spec)
+}
+
+func TestClusterScreenProbeFails(t *testing.T) {
+	app := testApp(t)
+	app.deps.Runner = probeFailRunner{inner: execx.DryRun{Delay: time.Millisecond}}
+	press := pressToCluster(t, app)
+
+	press("1", "enter")
+	scr := app.cur.(*clusterScreen)
+	if scr.mode != "probing" || scr.comp.failed == nil {
+		t.Fatalf("probe should have failed: mode=%s failed=%v", scr.mode, scr.comp.failed)
+	}
+	view := app.View()
+	if !strings.Contains(view, "Command failed") || !strings.Contains(view, "Unauthorized") {
+		t.Errorf("view missing failure message:\n%s", view)
+	}
+
+	// esc returns to list
+	pump(t, app, tea.KeyMsg{Type: tea.KeyEsc})
+	if scr.mode != "list" {
+		t.Errorf("after esc: mode = %q, want list", scr.mode)
+	}
+
+	// A cluster gcloud lists but kubectl cannot reach must stay selectable:
+	// the guard is advisory when it cannot run, not a wall. [y] proceeds
+	// through the pre-existing readiness check.
+	press("enter", "y")
+	if app.mach.Current() != state.Provision || app.deps.Setup.ClusterName != "substrate-poc" {
+		t.Errorf("continue without check: step=%v cluster=%q, want Provision/substrate-poc",
+			app.mach.Current(), app.deps.Setup.ClusterName)
+	}
+}

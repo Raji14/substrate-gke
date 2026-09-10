@@ -46,10 +46,11 @@ each running the real command it shows and streaming its output:
    install pushes nothing, so it is never asked for a registry.
 3. **Choose your GCP project** — validated with `gcloud projects describe`.
 4. **Connect your cluster** — lists your GKE clusters and whether each can run
-   Substrate, or lets you create a new one. Substrate needs the PodCertificate
-   Kubernetes beta APIs, which GKE only enables **at cluster creation** — clusters
-   created without them cannot be fixed afterward, which is why creating a fresh
-   cluster is the recommended path.
+   Substrate, or lets you create a new one. Connecting an existing cluster probes it
+   to ensure it is not already running Substrate, guarding against mixed-version installs.
+   Substrate needs the PodCertificate Kubernetes beta APIs, which GKE only enables
+   **at cluster creation** — clusters created without them cannot be fixed afterward,
+   which is why creating a fresh cluster is the recommended path.
 5. **Provision GCP resources** — `setup-gcp bootstrap`: APIs, the cluster (if new),
    the snapshot bucket, IAM grants, and monitoring dashboards. Idempotent.
 6. **Turn on Substrate** — `ate-setup deploy ate-system`: installs CRDs, the API

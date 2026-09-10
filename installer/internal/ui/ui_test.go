@@ -1101,8 +1101,8 @@ func TestLogViewerOverlay(t *testing.T) {
 	app.deps.LogPath = "/tmp/test-installer.log"
 	press := pressToCluster(t, app)
 
-	// Advance past cluster to Provision
-	press("enter", "y")
+	// Pick the substrate-ready cluster (1) and advance to Provision
+	press("1", "enter")
 	if app.mach.Current() != state.Provision {
 		t.Fatalf("expected Provision step, got %v", app.mach.Current())
 	}
@@ -1134,6 +1134,16 @@ func TestLogViewerOverlay(t *testing.T) {
 	if app.over != overlayNone {
 		t.Fatalf("expected overlayNone after v, got %v", app.over)
 	}
+
+	// Press 'v' to reopen and verify ctrl+c triggers exit modal
+	press("v")
+	if app.over != overlayLog {
+		t.Fatalf("expected overlayLog, got %v", app.over)
+	}
+	press("ctrl+c")
+	if app.over != overlayExit {
+		t.Fatalf("expected overlayExit after ctrl+c in log overlay, got %v", app.over)
+	}
 }
 
 type errorDetailRunner struct {
@@ -1143,7 +1153,7 @@ type errorDetailRunner struct {
 func (r errorDetailRunner) Start(ctx context.Context, spec execx.Spec) <-chan execx.Event {
 	ch := make(chan execx.Event, 4)
 	ch <- execx.Event{Line: "Step 1: initializing"}
-	ch <- execx.Event{Line: "Error from server (Forbidden): clusterrolebindings is forbidden"}
+	ch <- execx.Event{Line: "Error from server (Forbidden): clusterrolebindings is forbidden", Stderr: true}
 	ch <- execx.Event{Line: "Cleaning up temporary resources"}
 	ch <- execx.Event{Done: true, Err: errors.New("exit status 1")}
 	close(ch)
@@ -1156,8 +1166,8 @@ func TestErrorSnippetAndLogPathSurfaced(t *testing.T) {
 	app.deps.LogPath = "/path/to/installer-run.log"
 	press := pressToCluster(t, app)
 
-	// Advance past cluster to Provision, which will fail with errorDetailRunner
-	press("enter", "y")
+	// Pick the substrate-ready cluster (1) and advance to Provision, which will fail with errorDetailRunner
+	press("1", "enter")
 	if app.mach.Current() != state.Provision {
 		t.Fatalf("expected Provision step, got %v", app.mach.Current())
 	}
@@ -1182,10 +1192,22 @@ func TestErrorSnippetAndLogPathSurfaced(t *testing.T) {
 }
 
 func TestClampHeightPreservesFailure(t *testing.T) {
-	content := "Header\nLine 1\nLine 2\nLine 3\nLine 4\nCommand failed: exit status 1\nCause: something went wrong\nLog tail line"
-	// With h = 4, normal clampHeight would take first 4 lines ("Header\nLine 1\nLine 2\nLine 3"),
-	// completely cutting off the error and cause!
-	clamped := clampHeight(content, 4)
+	// Realistic failure layout: Command failed with cause, hints, log path, and 10-line tail panel below it (18+ lines)
+	var b strings.Builder
+	b.WriteString("Header\nLine 1\nLine 2\nLine 3\nLine 4\n")
+	b.WriteString("Command failed: exit status 1\n")
+	b.WriteString("Cause: something went wrong\n\n")
+	b.WriteString("Press [v] to view full log, [r] to retry.\n")
+	b.WriteString("Log file: /path/to/log\n")
+	b.WriteString("╭─ Log output ────────╮\n")
+	for i := 1; i <= 8; i++ {
+		b.WriteString(fmt.Sprintf("│ tail line %d          │\n", i))
+	}
+	b.WriteString("╰─────────────────────╯\n")
+
+	content := b.String()
+	// Even when Command failed is >15 lines from the bottom, clampHeight preserves the failure lines.
+	clamped := clampHeight(content, 10)
 	if !strings.Contains(clamped, "Command failed") || !strings.Contains(clamped, "Cause:") {
 		t.Errorf("clampHeight dropped failure lines:\n%s", clamped)
 	}

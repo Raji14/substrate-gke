@@ -56,6 +56,11 @@ type logProvider interface {
 	LogTitle() string
 }
 
+// execCompProvider is implemented by screens that host an execComp.
+type execCompProvider interface {
+	logComp() *execComp
+}
+
 // Screen is one wizard page. Update returns commands; navigation happens by
 // returning a navMsg-producing command.
 type Screen interface {
@@ -165,8 +170,9 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		a.width, a.height = m.Width, m.Height
 		if a.over == overlayLog {
+			bodyH := a.height - lipgloss.Height(a.headerView()) - lipgloss.Height(a.bottomView()) - 1
 			a.logView.Width = max(a.width-6, 20)
-			a.logView.Height = max(a.height-8, 5)
+			a.logView.Height = max(bodyH-6, 3)
 		}
 		return a, nil
 
@@ -193,9 +199,7 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				// A screen with a command in flight ends it; the summary
 				// printed on exit describes the final screen only if the
 				// user is still there.
-				if s, ok := a.cur.(interface{ Stop() }); ok {
-					s.Stop()
-				}
+				a.stopCurrent()
 				a.Completed = false
 				a.cur = a.screenFor(step)
 				return a, a.cur.Init()
@@ -203,6 +207,7 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return a, nil
 		case navQuit:
 			a.quitting = true
+			a.stopCurrent()
 			return a, tea.Quit
 		}
 
@@ -213,6 +218,15 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return a, a.cur.Update(msg)
 }
 
+func (a *App) stopCurrent() {
+	if s, ok := a.cur.(interface{ Stop() }); ok {
+		s.Stop()
+	}
+	if p, ok := a.cur.(execCompProvider); ok && p.logComp() != nil {
+		p.logComp().stop()
+	}
+}
+
 func (a *App) handleKey(m tea.KeyMsg) (tea.Model, tea.Cmd) {
 	key := m.String()
 
@@ -220,6 +234,7 @@ func (a *App) handleKey(m tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case overlayExit:
 		if key == "y" || key == "Y" {
 			a.quitting = true
+			a.stopCurrent()
 			return a, tea.Quit
 		}
 		a.over = overlayNone
@@ -243,6 +258,9 @@ func (a *App) handleKey(m tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return a, cmd
 	case overlayLog:
 		switch key {
+		case "ctrl+c", "ctrl+d":
+			a.over = overlayExit
+			return a, nil
 		case "esc", "q", "v", "V":
 			a.over = overlayNone
 			return a, nil
@@ -304,7 +322,10 @@ func (a *App) openLog() {
 	var lines []string
 	var title string
 
-	if ls, ok := a.cur.(logProvider); ok {
+	if p, ok := a.cur.(execCompProvider); ok && p.logComp() != nil {
+		lines = p.logComp().LogLines()
+		title = p.logComp().LogTitle()
+	} else if ls, ok := a.cur.(logProvider); ok {
 		lines = ls.LogLines()
 		title = ls.LogTitle()
 	}
@@ -312,7 +333,11 @@ func (a *App) openLog() {
 		if data, err := os.ReadFile(a.deps.LogPath); err == nil {
 			raw := strings.TrimRight(string(data), "\r\n")
 			if raw != "" {
-				lines = strings.Split(raw, "\n")
+				rawLines := strings.Split(raw, "\n")
+				lines = make([]string, 0, len(rawLines))
+				for _, rl := range rawLines {
+					lines = append(lines, execx.Clean(rl))
+				}
 				title = filepath.Base(a.deps.LogPath)
 			}
 		}
@@ -325,8 +350,12 @@ func (a *App) openLog() {
 	}
 	a.logTitle = title
 
+	header := a.headerView()
+	bottom := a.bottomView()
+	bodyH := a.height - lipgloss.Height(header) - lipgloss.Height(bottom) - 1
+
 	vpW := max(a.width-6, 20)
-	vpH := max(a.height-8, 5)
+	vpH := max(bodyH-6, 3)
 	a.logView = viewport.New(vpW, vpH)
 	a.logView.SetContent(strings.Join(lines, "\n"))
 	a.logView.GotoBottom()
@@ -334,6 +363,9 @@ func (a *App) openLog() {
 }
 
 func (a *App) logModalView(w, h int) string {
+	a.logView.Width = max(w-4, 20)
+	a.logView.Height = max(h-6, 3)
+
 	var b strings.Builder
 	header := theme.Title.Render("Log: " + a.logTitle)
 	if a.deps.LogPath != "" {

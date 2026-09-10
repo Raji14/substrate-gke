@@ -52,6 +52,8 @@ type Event struct {
 	// Done marks the final event; Err is the command error, if any.
 	Done bool
 	Err  error
+	// Stderr indicates this line originated from standard error.
+	Stderr bool
 }
 
 // Runner starts commands and streams their output.
@@ -63,8 +65,8 @@ var ansi = regexp.MustCompile(`\x1b\[[0-9;]*[A-Za-z]`)
 
 const maxLineLen = 2000
 
-// clean strips ANSI color codes and truncates pathological lines.
-func clean(line string) string {
+// Clean strips ANSI color codes and truncates pathological lines.
+func Clean(line string) string {
 	line = ansi.ReplaceAllString(line, "")
 	line = strings.TrimRight(line, "\r\n")
 	if len(line) > maxLineLen {
@@ -73,20 +75,69 @@ func clean(line string) string {
 	return line
 }
 
+func clean(line string) string { return Clean(line) }
+
 // Real executes commands with os/exec.
 type Real struct {
 	Log *Logger
+
+	mu       sync.Mutex
+	lastDone chan struct{}
+	wg       sync.WaitGroup
+}
+
+// Drain waits for in-flight commands to finish draining pipes and writing logs.
+func (r *Real) Drain() {
+	if r == nil {
+		return
+	}
+	done := make(chan struct{})
+	go func() {
+		r.wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+	}
 }
 
 // Start runs the command and streams its combined output line by line. The
 // channel is closed after the Done event.
-func (r Real) Start(ctx context.Context, spec Spec) <-chan Event {
+func (r *Real) Start(ctx context.Context, spec Spec) <-chan Event {
 	ch := make(chan Event, 64)
+
+	var prev <-chan struct{}
+	var done chan struct{}
+	if r != nil {
+		r.mu.Lock()
+		prev = r.lastDone
+		done = make(chan struct{})
+		r.lastDone = done
+		r.wg.Add(1)
+		r.mu.Unlock()
+	}
+
 	go func() {
 		defer close(ch)
+		if done != nil {
+			defer close(done)
+			defer r.wg.Done()
+		}
+
+		// Wait for any previous command to finish draining before logging start.
+		if prev != nil {
+			select {
+			case <-prev:
+			case <-time.After(2 * time.Second):
+			case <-ctx.Done():
+				ch <- Event{Done: true, Err: ctx.Err()}
+				return
+			}
+		}
 
 		start := time.Now()
-		if r.Log != nil {
+		if r != nil && r.Log != nil {
 			r.Log.LogCommandStart(spec)
 		}
 
@@ -96,7 +147,7 @@ func (r Real) Start(ctx context.Context, spec Spec) <-chan Event {
 
 		stdout, err := cmd.StdoutPipe()
 		if err != nil {
-			if r.Log != nil {
+			if r != nil && r.Log != nil {
 				r.Log.LogCommandEnd(spec, err, time.Since(start))
 			}
 			ch <- Event{Done: true, Err: err}
@@ -104,14 +155,14 @@ func (r Real) Start(ctx context.Context, spec Spec) <-chan Event {
 		}
 		stderr, err := cmd.StderrPipe()
 		if err != nil {
-			if r.Log != nil {
+			if r != nil && r.Log != nil {
 				r.Log.LogCommandEnd(spec, err, time.Since(start))
 			}
 			ch <- Event{Done: true, Err: err}
 			return
 		}
 		if err := cmd.Start(); err != nil {
-			if r.Log != nil {
+			if r != nil && r.Log != nil {
 				r.Log.LogCommandEnd(spec, err, time.Since(start))
 			}
 			ch <- Event{Done: true, Err: err}
@@ -119,27 +170,27 @@ func (r Real) Start(ctx context.Context, spec Spec) <-chan Event {
 		}
 
 		var wg sync.WaitGroup
-		scan := func(rd io.Reader) {
+		scan := func(rd io.Reader, isStderr bool) {
 			defer wg.Done()
 			sc := bufio.NewScanner(rd)
 			sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 			for sc.Scan() {
 				raw := sc.Text()
-				if r.Log != nil {
+				if r != nil && r.Log != nil {
 					r.Log.LogLine(raw)
 				}
-				if line := clean(raw); line != "" {
-					ch <- Event{Line: line}
+				if line := Clean(raw); line != "" {
+					ch <- Event{Line: line, Stderr: isStderr}
 				}
 			}
 		}
 		wg.Add(2)
-		go scan(stdout)
-		go scan(stderr)
+		go scan(stdout, false)
+		go scan(stderr, true)
 		wg.Wait()
 
 		waitErr := cmd.Wait()
-		if r.Log != nil {
+		if r != nil && r.Log != nil {
 			r.Log.LogCommandEnd(spec, waitErr, time.Since(start))
 		}
 		ch <- Event{Done: true, Err: waitErr}

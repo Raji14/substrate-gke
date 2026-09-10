@@ -63,18 +63,7 @@ func newUpgradeSourceScreen(deps *Deps) *upgradeSourceScreen {
 
 func (s *upgradeSourceScreen) Init() tea.Cmd      { return nil }
 func (s *upgradeSourceScreen) CapturesText() bool { return s.mode == "target" || s.mode == "manual" }
-func (s *upgradeSourceScreen) LogLines() []string {
-	if s.comp != nil {
-		return s.comp.LogLines()
-	}
-	return nil
-}
-func (s *upgradeSourceScreen) LogTitle() string {
-	if s.comp != nil {
-		return s.comp.LogTitle()
-	}
-	return ""
-}
+func (s *upgradeSourceScreen) logComp() *execComp { return s.comp }
 
 // Stop ends a read left running when the screen is navigated away from.
 func (s *upgradeSourceScreen) Stop() {
@@ -87,7 +76,7 @@ func (s *upgradeSourceScreen) Hints() []Hint {
 	switch s.mode {
 	case "reading":
 		if s.comp != nil && s.comp.failed != nil {
-			return []Hint{{"v", "view log"}, {"r", "retry"}, {"m", "describe the installed Substrate by hand"}, {"b", "back"}}
+			return []Hint{{"r", "retry"}, {"m", "describe the installed Substrate by hand"}, {"b", "back"}}
 		}
 		return []Hint{{"esc", "cancel"}}
 	case "choose":
@@ -154,7 +143,7 @@ func (s *upgradeSourceScreen) submitTarget() tea.Cmd {
 	// Whatever an earlier read learned belonged to the cluster it named.
 	st.InstalledCommit, st.InstalledVersion, st.InstalledImageRepo, st.InstalledImageTag, st.KoDockerRepo = "", "", "", "", ""
 	s.mode, s.errText, s.fields, s.parsed = "reading", "", nil, false
-	s.comp = newExecComp(s.deps.Runner, snapshot.ProbeCluster(st, true), nil).withLogPath(s.deps.LogPath)
+	s.comp = newExecComp(s.deps.Runner, snapshot.ProbeCluster(st, true), nil, s.deps.LogPath)
 	return s.comp.start()
 }
 
@@ -361,7 +350,7 @@ func newUpgradePlanScreen(deps *Deps) *upgradePlanScreen {
 		return s
 	}
 	s.installedDir, s.nextDir = deps.Builder.UpgradeTrees(deps.UpgradeDir, st)
-	s.comp = newExecComp(deps.Runner, deps.Builder.FetchTrees(st, s.installedDir, s.nextDir), nil).withLogPath(deps.LogPath)
+	s.comp = newExecComp(deps.Runner, deps.Builder.FetchTrees(st, s.installedDir, s.nextDir), nil, deps.LogPath)
 	return s
 }
 
@@ -372,18 +361,7 @@ func (s *upgradePlanScreen) Init() tea.Cmd {
 	return s.comp.start()
 }
 func (s *upgradePlanScreen) CapturesText() bool { return false }
-func (s *upgradePlanScreen) LogLines() []string {
-	if s.comp != nil {
-		return s.comp.LogLines()
-	}
-	return nil
-}
-func (s *upgradePlanScreen) LogTitle() string {
-	if s.comp != nil {
-		return s.comp.LogTitle()
-	}
-	return ""
-}
+func (s *upgradePlanScreen) logComp() *execComp { return s.comp }
 
 // Stop ends a fetch left running when the screen is navigated away from.
 func (s *upgradePlanScreen) Stop() {
@@ -393,19 +371,15 @@ func (s *upgradePlanScreen) Stop() {
 }
 
 func (s *upgradePlanScreen) Hints() []Hint {
-	var hints []Hint
-	if s.comp != nil && len(s.comp.lines) > 0 {
-		hints = append(hints, Hint{"v", "view log"})
-	}
 	switch {
 	case s.comp == nil:
 		return []Hint{{"b", "back"}}
 	case s.comp.ok():
-		return append(hints, Hint{"enter", "finish"})
+		return []Hint{{"enter", "finish"}}
 	case s.comp.failed != nil:
-		return append(hints, Hint{"r", "retry"}, Hint{"b", "back"})
+		return []Hint{{"r", "retry"}, {"b", "back"}}
 	}
-	return hints
+	return nil
 }
 
 func (s *upgradePlanScreen) Update(msg tea.Msg) tea.Cmd {

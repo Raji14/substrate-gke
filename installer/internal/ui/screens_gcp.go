@@ -291,18 +291,7 @@ func (s *clusterScreen) Init() tea.Cmd {
 }
 
 func (s *clusterScreen) CapturesText() bool { return s.mode == "name" }
-func (s *clusterScreen) LogLines() []string {
-	if s.comp != nil {
-		return s.comp.LogLines()
-	}
-	return nil
-}
-func (s *clusterScreen) LogTitle() string {
-	if s.comp != nil {
-		return s.comp.LogTitle()
-	}
-	return ""
-}
+func (s *clusterScreen) logComp() *execComp   { return s.comp }
 
 func (s *clusterScreen) Hints() []Hint {
 	switch s.mode {
@@ -346,7 +335,7 @@ func (s *clusterScreen) probe(c gcp.Cluster) tea.Cmd {
 		return s.decide(c, res)
 	}
 	s.mode, s.parsed = "probing", false
-	s.comp = newExecComp(s.deps.Runner, snapshot.CheckInstalled(s.deps.Setup.ProjectID, c.Name, c.Location), nil).withLogPath(s.deps.LogPath)
+	s.comp = newExecComp(s.deps.Runner, snapshot.CheckInstalled(s.deps.Setup.ProjectID, c.Name, c.Location), nil, s.deps.LogPath)
 	return s.comp.start()
 }
 

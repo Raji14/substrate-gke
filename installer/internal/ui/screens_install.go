@@ -38,27 +38,22 @@ type provisionScreen struct {
 func newProvisionScreen(deps *Deps) *provisionScreen {
 	return &provisionScreen{
 		deps: deps,
-		comp: newExecComp(deps.Runner, deps.Builder.Bootstrap(deps.Setup), steps.Bootstrap()).withLogPath(deps.LogPath),
+		comp: newExecComp(deps.Runner, deps.Builder.Bootstrap(deps.Setup), steps.Bootstrap(), deps.LogPath),
 	}
 }
 
 func (s *provisionScreen) Init() tea.Cmd      { return s.comp.start() }
 func (s *provisionScreen) CapturesText() bool { return false }
-func (s *provisionScreen) LogLines() []string { return s.comp.LogLines() }
-func (s *provisionScreen) LogTitle() string   { return s.comp.LogTitle() }
+func (s *provisionScreen) logComp() *execComp { return s.comp }
 
 func (s *provisionScreen) Hints() []Hint {
-	var hints []Hint
-	if len(s.comp.lines) > 0 {
-		hints = append(hints, Hint{"v", "view log"})
-	}
 	switch {
 	case s.comp.ok():
-		hints = append(hints, Hint{"enter", "continue"})
+		return []Hint{{"enter", "continue"}}
 	case s.comp.failed != nil:
-		hints = append(hints, Hint{"r", "retry"}, Hint{"b", "back"})
+		return []Hint{{"r", "retry"}, {"b", "back"}}
 	}
-	return hints
+	return nil
 }
 
 func (s *provisionScreen) Update(msg tea.Msg) tea.Cmd {
@@ -114,20 +109,16 @@ type controlPlaneScreen struct {
 func newControlPlaneScreen(deps *Deps) *controlPlaneScreen {
 	return &controlPlaneScreen{
 		deps: deps,
-		comp: newExecComp(deps.Runner, deps.Builder.DeployAteSystem(deps.Setup), steps.Deploy(deps.Setup.Prebuilt())).withLogPath(deps.LogPath),
+		comp: newExecComp(deps.Runner, deps.Builder.DeployAteSystem(deps.Setup), steps.Deploy(deps.Setup.Prebuilt()), deps.LogPath),
 	}
 }
 
 func (s *controlPlaneScreen) Init() tea.Cmd      { return s.comp.start() }
 func (s *controlPlaneScreen) CapturesText() bool { return false }
-func (s *controlPlaneScreen) LogLines() []string { return s.comp.LogLines() }
-func (s *controlPlaneScreen) LogTitle() string   { return s.comp.LogTitle() }
+func (s *controlPlaneScreen) logComp() *execComp { return s.comp }
 
 func (s *controlPlaneScreen) Hints() []Hint {
 	hints := []Hint{{"m", "command drawer"}}
-	if len(s.comp.lines) > 0 {
-		hints = append(hints, Hint{"v", "view log"})
-	}
 	switch {
 	case s.comp.ok():
 		hints = append(hints, Hint{"enter", "continue"})
@@ -198,32 +189,17 @@ func newFilestoreScreen(deps *Deps) *filestoreScreen {
 
 func (s *filestoreScreen) Init() tea.Cmd      { return nil }
 func (s *filestoreScreen) CapturesText() bool { return false }
-func (s *filestoreScreen) LogLines() []string {
-	if s.comp != nil {
-		return s.comp.LogLines()
-	}
-	return nil
-}
-func (s *filestoreScreen) LogTitle() string {
-	if s.comp != nil {
-		return s.comp.LogTitle()
-	}
-	return ""
-}
+func (s *filestoreScreen) logComp() *execComp { return s.comp }
 
 func (s *filestoreScreen) Hints() []Hint {
 	if s.comp != nil {
-		var hints []Hint
-		if len(s.comp.lines) > 0 {
-			hints = append(hints, Hint{"v", "view log"})
-		}
 		if s.comp.ok() {
-			return append(hints, Hint{"enter", "continue"})
+			return []Hint{{"enter", "continue"}}
 		}
 		if s.comp.failed != nil {
-			return append(hints, Hint{"r", "retry"}, Hint{"s", "skip"})
+			return []Hint{{"r", "retry"}, {"s", "skip"}}
 		}
-		return hints
+		return nil
 	}
 	return []Hint{{"1/2", "choose"}, {"enter", "confirm"}, {"s", "skip"}, {"b", "back"}}
 }
@@ -270,7 +246,7 @@ func (s *filestoreScreen) Update(msg tea.Msg) tea.Cmd {
 		if s.cursor == 1 {
 			return goNext
 		}
-		s.comp = newExecComp(s.deps.Runner, s.deps.Builder.DeployFilestoreCSI(s.deps.Setup), steps.FilestoreCSI()).withLogPath(s.deps.LogPath)
+		s.comp = newExecComp(s.deps.Runner, s.deps.Builder.DeployFilestoreCSI(s.deps.Setup), steps.FilestoreCSI(), s.deps.LogPath)
 		return s.comp.start()
 	}
 	return nil
@@ -350,19 +326,7 @@ func (s *autoscalingScreen) Init() tea.Cmd {
 }
 
 func (s *autoscalingScreen) CapturesText() bool { return s.mode == "bounds" }
-func (s *autoscalingScreen) LogLines() []string {
-	if s.comp != nil {
-		return s.comp.LogLines()
-	}
-	return nil
-}
-
-func (s *autoscalingScreen) LogTitle() string {
-	if s.comp != nil {
-		return s.comp.LogTitle()
-	}
-	return ""
-}
+func (s *autoscalingScreen) logComp() *execComp { return s.comp }
 
 func (s *autoscalingScreen) Hints() []Hint {
 	switch s.mode {
@@ -371,17 +335,12 @@ func (s *autoscalingScreen) Hints() []Hint {
 	case "bounds":
 		return []Hint{{"tab", "min/max"}, {"enter", "apply"}, {"esc", "back"}}
 	case "exec":
-		var hints []Hint
-		if s.comp != nil && len(s.comp.lines) > 0 {
-			hints = append(hints, Hint{"v", "view log"})
-		}
 		if s.comp.ok() {
-			return append(hints, Hint{"enter", "continue"})
+			return []Hint{{"enter", "continue"}}
 		}
 		if s.comp != nil && s.comp.failed != nil {
-			return append(hints, Hint{"r", "retry"}, Hint{"s", "skip"})
+			return []Hint{{"r", "retry"}, {"s", "skip"}}
 		}
-		return hints
 	}
 	return nil
 }
@@ -463,7 +422,7 @@ func (s *autoscalingScreen) Update(msg tea.Msg) tea.Cmd {
 			st := s.deps.Setup
 			st.AutoscaleMin, st.AutoscaleMax = minNodes, maxNodes
 			s.mode = "exec"
-			s.comp = newExecComp(s.deps.Runner, s.deps.Builder.EnableAutoscaling(st), nil).withLogPath(s.deps.LogPath)
+			s.comp = newExecComp(s.deps.Runner, s.deps.Builder.EnableAutoscaling(st), nil, s.deps.LogPath)
 			return s.comp.start()
 		}
 		if s.focus == 0 {
@@ -556,32 +515,17 @@ func newDemoScreen(deps *Deps) *demoScreen { return &demoScreen{deps: deps} }
 
 func (s *demoScreen) Init() tea.Cmd      { return nil }
 func (s *demoScreen) CapturesText() bool { return false }
-func (s *demoScreen) LogLines() []string {
-	if s.comp != nil {
-		return s.comp.LogLines()
-	}
-	return nil
-}
-func (s *demoScreen) LogTitle() string {
-	if s.comp != nil {
-		return s.comp.LogTitle()
-	}
-	return ""
-}
+func (s *demoScreen) logComp() *execComp { return s.comp }
 
 func (s *demoScreen) Hints() []Hint {
 	if s.comp != nil {
-		var hints []Hint
-		if len(s.comp.lines) > 0 {
-			hints = append(hints, Hint{"v", "view log"})
-		}
 		if s.comp.ok() {
-			return append(hints, Hint{"enter", "continue"})
+			return []Hint{{"enter", "continue"}}
 		}
 		if s.comp.failed != nil {
-			return append(hints, Hint{"r", "retry"}, Hint{"s", "skip"})
+			return []Hint{{"r", "retry"}, {"s", "skip"}}
 		}
-		return hints
+		return nil
 	}
 	return []Hint{{"1/2", "choose"}, {"enter", "confirm"}, {"b", "back"}}
 }
@@ -626,7 +570,7 @@ func (s *demoScreen) Update(msg tea.Msg) tea.Cmd {
 		if s.cursor == 1 {
 			return goNext
 		}
-		s.comp = newExecComp(s.deps.Runner, s.deps.Builder.DeployDemo(s.deps.Setup, "counter"), nil).withLogPath(s.deps.LogPath)
+		s.comp = newExecComp(s.deps.Runner, s.deps.Builder.DeployDemo(s.deps.Setup, "counter"), nil, s.deps.LogPath)
 		return s.comp.start()
 	}
 	return nil
@@ -670,28 +614,13 @@ func newCompleteScreen(deps *Deps) *completeScreen { return &completeScreen{deps
 
 func (s *completeScreen) Init() tea.Cmd      { return nil }
 func (s *completeScreen) CapturesText() bool { return false }
-func (s *completeScreen) LogLines() []string {
-	if s.comp != nil {
-		return s.comp.LogLines()
-	}
-	return nil
-}
-func (s *completeScreen) LogTitle() string {
-	if s.comp != nil {
-		return s.comp.LogTitle()
-	}
-	return ""
-}
+func (s *completeScreen) logComp() *execComp { return s.comp }
 
 func (s *completeScreen) Hints() []Hint {
-	var hints []Hint
-	if s.comp != nil && len(s.comp.lines) > 0 {
-		hints = append(hints, Hint{"v", "view log"})
-	}
 	if s.comp == nil && !s.deps.Setup.Upgrade {
-		return append(hints, Hint{"y", "verify the install"}, Hint{"enter/q", "finish"})
+		return []Hint{{"y", "verify the install"}, {"enter/q", "finish"}}
 	}
-	return append(hints, Hint{"enter/q", "finish"})
+	return []Hint{{"enter/q", "finish"}}
 }
 
 func (s *completeScreen) Update(msg tea.Msg) tea.Cmd {
@@ -707,7 +636,7 @@ func (s *completeScreen) Update(msg tea.Msg) tea.Cmd {
 		switch key.String() {
 		case "y":
 			if s.comp == nil && !s.deps.Setup.Upgrade {
-				s.comp = newExecComp(s.deps.Runner, s.deps.Builder.Verify(s.deps.Setup), nil).withLogPath(s.deps.LogPath)
+				s.comp = newExecComp(s.deps.Runner, s.deps.Builder.Verify(s.deps.Setup), nil, s.deps.LogPath)
 				return s.comp.start()
 			}
 		case "enter", "q":

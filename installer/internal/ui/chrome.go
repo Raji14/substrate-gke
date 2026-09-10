@@ -118,6 +118,9 @@ func (a *App) bottomView() string {
 	}
 
 	hints := a.cur.Hints()
+	if p, ok := a.cur.(execCompProvider); ok && p.logComp() != nil && len(p.logComp().lines) > 0 {
+		hints = append(hints, Hint{"v", "view log"})
+	}
 	hints = append(hints,
 		Hint{"?", "help"},
 		Hint{"/", "commands"},
@@ -162,8 +165,8 @@ func (a *App) exitView(w int) string {
 }
 
 // clampHeight truncates rendered content to at most h lines. If the content
-// contains an error or failure notification near the bottom, the bottom lines
-// (the error panel and recent logs) are preserved instead of being cut off.
+// contains an error or failure notification, the bottom lines (the error panel
+// and recent logs) are preserved instead of being cut off.
 func clampHeight(s string, h int) string {
 	if h <= 0 {
 		return s
@@ -173,8 +176,8 @@ func clampHeight(s string, h int) string {
 		return s
 	}
 	hasError := false
-	for i := len(lines) - 1; i >= max(0, len(lines)-15); i-- {
-		if strings.Contains(lines[i], "Command failed") || strings.Contains(lines[i], "failed:") {
+	for i := len(lines) - 1; i >= 0; i-- {
+		if strings.Contains(lines[i], "Command failed: ") || strings.Contains(lines[i], "Command failed") {
 			hasError = true
 			break
 		}

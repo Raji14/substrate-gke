@@ -46,15 +46,17 @@ type execComp struct {
 	started  bool
 	finished bool
 	failed   error
+	cause    string
 	active   int
 	frame    int
 	lines    []string
+	stderr   []string
 	ch       <-chan execx.Event
 	cancel   context.CancelFunc
 }
 
-func newExecComp(runner execx.Runner, spec execx.Spec, items []steps.ChecklistItem) *execComp {
-	return &execComp{runner: runner, spec: spec, items: items, active: -1}
+func newExecComp(runner execx.Runner, spec execx.Spec, items []steps.ChecklistItem, logPath string) *execComp {
+	return &execComp{runner: runner, spec: spec, items: items, logPath: logPath, active: -1}
 }
 
 func (c *execComp) withLogPath(path string) *execComp {
@@ -78,34 +80,68 @@ func (c *execComp) LogTitle() string {
 	return c.spec.Display
 }
 
-var errKeywords = []string{
-	"error:", "Error:", "ERROR",
-	"fatal:", "Fatal:", "FATAL",
-	"failed:", "Failed:", "FAILED",
+var strongErrKeywords = []string{
+	"error:", "Error:", "ERROR:", "[ERROR]",
+	"fatal:", "Fatal:", "FATAL:",
 	"denied", "forbidden", "Forbidden",
 	"Unauthorized", "unauthorized",
-	"NotFound", "not found", "does not exist",
-	"exceeded", "timed out", "timeout",
-	"cannot ", "Cannot ",
+	"NotFound", "does not exist",
+	"timed out", "timeout", "deadline exceeded",
+}
+
+func lineMatchesError(line string) bool {
+	lower := strings.ToLower(line)
+	for _, kw := range strongErrKeywords {
+		if strings.Contains(lower, strings.ToLower(kw)) {
+			return true
+		}
+	}
+	return false
+}
+
+func extractCause(stderr, allLines []string) string {
+	// First check recent stderr lines (up to 30) for clear error diagnostics
+	var lastStderr string
+	start := 0
+	if len(stderr) > 30 {
+		start = len(stderr) - 30
+	}
+	for i := len(stderr) - 1; i >= start; i-- {
+		line := strings.TrimSpace(stderr[i])
+		if line == "" || strings.HasPrefix(line, "exit status ") || strings.HasPrefix(line, "make: ***") {
+			continue
+		}
+		if lineMatchesError(line) {
+			return line
+		}
+		if lastStderr == "" {
+			lastStderr = line
+		}
+	}
+
+	// Next check recent lines in all output (up to 30)
+	allStart := 0
+	if len(allLines) > 30 {
+		allStart = len(allLines) - 30
+	}
+	for i := len(allLines) - 1; i >= allStart; i-- {
+		line := strings.TrimSpace(allLines[i])
+		if line == "" || strings.HasPrefix(line, "exit status ") || strings.HasPrefix(line, "make: ***") {
+			continue
+		}
+		if lineMatchesError(line) {
+			return line
+		}
+	}
+
+	if lastStderr != "" {
+		return lastStderr
+	}
+	return ""
 }
 
 func findErrorSnippet(lines []string) string {
-	for i := len(lines) - 1; i >= 0; i-- {
-		line := strings.TrimSpace(lines[i])
-		if line == "" {
-			continue
-		}
-		if strings.HasPrefix(line, "exit status ") || strings.HasPrefix(line, "make: ***") {
-			continue
-		}
-		lower := strings.ToLower(line)
-		for _, kw := range errKeywords {
-			if strings.Contains(lower, strings.ToLower(kw)) {
-				return line
-			}
-		}
-	}
-	return ""
+	return extractCause(nil, lines)
 }
 
 func (c *execComp) start() tea.Cmd {
@@ -120,7 +156,7 @@ func (c *execComp) restart() tea.Cmd {
 	if c.cancel != nil {
 		c.cancel()
 	}
-	c.finished, c.failed, c.active, c.lines = false, nil, -1, nil
+	c.finished, c.failed, c.cause, c.active, c.lines, c.stderr = false, nil, "", -1, nil, nil
 	return c.start()
 }
 
@@ -161,11 +197,20 @@ func (c *execComp) update(msg tea.Msg) (cmd tea.Cmd, handled bool) {
 		if m.ev.Done {
 			c.finished = true
 			c.failed = m.ev.Err
+			if c.failed != nil {
+				c.cause = extractCause(c.stderr, c.lines)
+			}
 			return nil, true
 		}
 		c.lines = append(c.lines, m.ev.Line)
 		if len(c.lines) > 5000 {
 			c.lines = c.lines[len(c.lines)-5000:]
+		}
+		if m.ev.Stderr {
+			c.stderr = append(c.stderr, m.ev.Line)
+			if len(c.stderr) > 100 {
+				c.stderr = c.stderr[len(c.stderr)-100:]
+			}
 		}
 		c.active = steps.Progress(c.items, c.active, m.ev.Line)
 		return c.read(), true
@@ -215,8 +260,12 @@ func (c *execComp) view(w int) string {
 	if c.failed != nil {
 		var panel strings.Builder
 		panel.WriteString(theme.Bad.Render("Command failed: ") + c.failed.Error())
-		if snippet := findErrorSnippet(c.lines); snippet != "" && snippet != c.failed.Error() {
-			panel.WriteString("\n\n" + theme.Warning.Render("Cause: ") + theme.Subtle.Render(snippet))
+		cause := c.cause
+		if cause == "" {
+			cause = findErrorSnippet(c.lines)
+		}
+		if cause != "" && cause != c.failed.Error() {
+			panel.WriteString("\n\n" + theme.Warning.Render("Cause: ") + theme.Subtle.Render(cause))
 		}
 		panel.WriteString("\n\n" + theme.Subtle.Render("Press ") + theme.Key.Render("[v]") + theme.Subtle.Render(" to view full log, ") + theme.Key.Render("[r]") + theme.Subtle.Render(" to retry."))
 		if c.logPath != "" {
@@ -226,14 +275,33 @@ func (c *execComp) view(w int) string {
 	}
 
 	if len(c.lines) > 0 {
-		tail := c.lines
-		if len(tail) > logTail {
-			tail = tail[len(tail)-logTail:]
+		lw := max(w-8, 20)
+		var visualRows []string
+		for i := len(c.lines) - 1; i >= 0 && len(visualRows) < logTail; i-- {
+			line := c.lines[i]
+			if len(line) <= lw {
+				visualRows = append([]string{line}, visualRows...)
+			} else {
+				var chunks []string
+				for len(line) > lw {
+					chunks = append(chunks, line[:lw])
+					line = line[lw:]
+				}
+				if len(line) > 0 {
+					chunks = append(chunks, line)
+				}
+				needed := logTail - len(visualRows)
+				if len(chunks) > needed {
+					chunks = chunks[len(chunks)-needed:]
+				}
+				visualRows = append(chunks, visualRows...)
+			}
 		}
+
 		var log strings.Builder
-		for i, line := range tail {
-			log.WriteString(theme.Subtle.Render(line))
-			if i < len(tail)-1 {
+		for i, row := range visualRows {
+			log.WriteString(theme.Subtle.Render(row))
+			if i < len(visualRows)-1 {
 				log.WriteString("\n")
 			}
 		}

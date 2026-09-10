@@ -80,7 +80,7 @@ func main() {
 		defer logger.Close()
 	}
 
-	var runner execx.Runner = execx.Real{Log: logger}
+	var runner execx.Runner = &execx.Real{Log: logger}
 	if *dryRun {
 		runner = execx.DryRun{Log: logger}
 	}
@@ -116,6 +116,9 @@ func main() {
 	if _, err := tea.NewProgram(app, tea.WithAltScreen()).Run(); err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
 		os.Exit(1)
+	}
+	if d, ok := runner.(interface{ Drain() }); ok {
+		d.Drain()
 	}
 
 	// Only once the install actually worked, and never against a simulated

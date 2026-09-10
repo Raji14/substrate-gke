@@ -589,9 +589,19 @@ func (s *clusterScreen) View(w int) string {
 	}
 
 	for i, c := range s.clusters {
+		// "substrate-ready" is capability (the beta APIs), not install state:
+		// what the probe learned about an actual install is its own badge, so
+		// a teardown visibly clears it while readiness rightly stays.
 		badge := theme.Good.Render(theme.GlyphDone + " substrate-ready")
 		if !c.SubstrateReady() {
 			badge = theme.Bad.Render(theme.GlyphFail + " beta APIs missing")
+		}
+		if res, ok := s.probed[c.Name+"/"+c.Location]; ok && res.Installed {
+			label := " · substrate installed"
+			if res.Partial() {
+				label = " · partial install"
+			}
+			badge += theme.Warning.Render(label)
 		}
 		row := fmt.Sprintf("[%d] %-24s %-14s %-18s %2d nodes  %s", i+1, c.Name, c.Location, c.MasterVersion, c.NodeCount, badge)
 		if i == s.cursor {

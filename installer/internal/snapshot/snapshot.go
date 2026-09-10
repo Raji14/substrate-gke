@@ -320,13 +320,21 @@ func (b *Builder) TeardownCommand(st *state.Setup, root string) string {
 // CheckInstalled it takes the cluster by name: the selection is not committed
 // to Setup yet. The env rides inside the command like TeardownCommand's, so
 // the delete can only hit the cluster it names, never an ambient context.
+//
+// ate-setup returns while the namespace is still deleting, so the command
+// waits for it to actually go: the guard re-probes the moment this finishes,
+// and a probe of a half-deleted install would report — and cache — the very
+// state the teardown just removed.
 func (b *Builder) DeleteAteSystem(projectID, cluster, location string) execx.Spec {
 	env := fmt.Sprintf("PROJECT_ID=%s CLUSTER_NAME=%s CLUSTER_LOCATION=%s NO_DEV_ENV=1",
 		ShellQuote(projectID), ShellQuote(cluster), ShellQuote(location))
+	lines := []string{env + " go run ./cmd/ate-setup delete ate-system"}
+	lines = append(lines, credentialLines(projectID, cluster, location)...)
+	lines = append(lines, "kubectl wait --for=delete namespace/ate-system --timeout=180s")
 	return execx.Spec{
 		Label:   "ate-setup delete ate-system",
-		Display: "go run ./cmd/ate-setup delete ate-system",
-		Argv:    b.inTree(env + " go run ./cmd/ate-setup delete ate-system"),
+		Display: "go run ./cmd/ate-setup delete ate-system && kubectl wait --for=delete namespace/ate-system",
+		Argv:    b.inTree(strings.Join(lines, "\n")),
 		SimLines: append(b.fetchSimLines(),
 			"[step]: delete_ate_system",
 			`namespace "ate-system" deleted`,

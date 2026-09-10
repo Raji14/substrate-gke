@@ -990,6 +990,11 @@ func TestClusterScreenBlocksAlreadyInstalledCluster(t *testing.T) {
 		t.Errorf("aborted selection leaked into Setup: cluster=%q zone=%q bucket=%q",
 			st.ClusterName, st.Zone, st.BucketName)
 	}
+	// Back in the list, the probe's verdict is visible on the row — distinct
+	// from the "substrate-ready" capability badge, which rightly stays.
+	if view := app.View(); !strings.Contains(view, "substrate installed") {
+		t.Errorf("list row missing the installed badge:\n%s", view)
+	}
 	// Re-selecting the same cluster answers from the cache instead of paying
 	// another gcloud+kubectl round trip.
 	press("enter")

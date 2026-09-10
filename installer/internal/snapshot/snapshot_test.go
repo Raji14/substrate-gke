@@ -234,6 +234,11 @@ func TestDeleteAteSystemNamesTheCluster(t *testing.T) {
 		"CLUSTER_NAME=" + ShellQuote("prod cluster"),
 		"CLUSTER_LOCATION=" + ShellQuote("us-west1-c"),
 		"NO_DEV_ENV=1 go run ./cmd/ate-setup delete ate-system",
+		// ate-setup returns while the namespace is still deleting; the
+		// teardown must outlast it, or the immediate re-probe reads (and
+		// caches) the half-deleted install as still installed.
+		"kubectl wait --for=delete namespace/ate-system",
+		`KUBECONFIG=$(mktemp)`,
 	} {
 		if !strings.Contains(script, want) {
 			t.Errorf("delete script missing %q:\n%s", want, script)

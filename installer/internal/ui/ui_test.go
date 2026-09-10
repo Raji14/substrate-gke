@@ -1095,3 +1095,98 @@ func TestClusterScreenProbeFails(t *testing.T) {
 			app.mach.Current(), app.deps.Setup.ClusterName)
 	}
 }
+
+func TestLogViewerOverlay(t *testing.T) {
+	app := testApp(t)
+	app.deps.LogPath = "/tmp/test-installer.log"
+	press := pressToCluster(t, app)
+
+	// Advance past cluster to Provision
+	press("enter", "y")
+	if app.mach.Current() != state.Provision {
+		t.Fatalf("expected Provision step, got %v", app.mach.Current())
+	}
+
+	// Press 'v' to open log viewer overlay
+	press("v")
+	if app.over != overlayLog {
+		t.Fatalf("expected overlayLog, got %v", app.over)
+	}
+	view := app.View()
+	if !strings.Contains(view, "Log:") || !strings.Contains(view, "press [esc] or [v] to close") {
+		t.Errorf("view missing log viewer chrome:\n%s", view)
+	}
+
+	// Press 'esc' to dismiss
+	pump(t, app, tea.KeyMsg{Type: tea.KeyEsc})
+	if app.over != overlayNone {
+		t.Fatalf("expected overlayNone after esc, got %v", app.over)
+	}
+
+	// Test slash command /log also opens it
+	press("/", "l", "o", "g", "enter")
+	if app.over != overlayLog {
+		t.Fatalf("expected overlayLog via /log, got %v", app.over)
+	}
+
+	// Press 'v' to toggle off
+	press("v")
+	if app.over != overlayNone {
+		t.Fatalf("expected overlayNone after v, got %v", app.over)
+	}
+}
+
+type errorDetailRunner struct {
+	inner execx.Runner
+}
+
+func (r errorDetailRunner) Start(ctx context.Context, spec execx.Spec) <-chan execx.Event {
+	ch := make(chan execx.Event, 4)
+	ch <- execx.Event{Line: "Step 1: initializing"}
+	ch <- execx.Event{Line: "Error from server (Forbidden): clusterrolebindings is forbidden"}
+	ch <- execx.Event{Line: "Cleaning up temporary resources"}
+	ch <- execx.Event{Done: true, Err: errors.New("exit status 1")}
+	close(ch)
+	return ch
+}
+
+func TestErrorSnippetAndLogPathSurfaced(t *testing.T) {
+	app := testApp(t)
+	app.deps.Runner = errorDetailRunner{inner: execx.DryRun{Delay: time.Millisecond}}
+	app.deps.LogPath = "/path/to/installer-run.log"
+	press := pressToCluster(t, app)
+
+	// Advance past cluster to Provision, which will fail with errorDetailRunner
+	press("enter", "y")
+	if app.mach.Current() != state.Provision {
+		t.Fatalf("expected Provision step, got %v", app.mach.Current())
+	}
+	scr := app.cur.(*provisionScreen)
+	if scr.comp.failed == nil {
+		t.Fatalf("expected command to fail")
+	}
+
+	view := app.View()
+	if !strings.Contains(view, "Command failed: exit status 1") {
+		t.Errorf("view missing command failed error code:\n%s", view)
+	}
+	if !strings.Contains(view, "Cause: Error from server (Forbidden): clusterrolebindings is forbidden") {
+		t.Errorf("view missing extracted cause:\n%s", view)
+	}
+	if !strings.Contains(view, "[v] to view full log") {
+		t.Errorf("view missing [v] hint in error panel:\n%s", view)
+	}
+	if !strings.Contains(view, "/path/to/installer-run.log") {
+		t.Errorf("view missing log file path:\n%s", view)
+	}
+}
+
+func TestClampHeightPreservesFailure(t *testing.T) {
+	content := "Header\nLine 1\nLine 2\nLine 3\nLine 4\nCommand failed: exit status 1\nCause: something went wrong\nLog tail line"
+	// With h = 4, normal clampHeight would take first 4 lines ("Header\nLine 1\nLine 2\nLine 3"),
+	// completely cutting off the error and cause!
+	clamped := clampHeight(content, 4)
+	if !strings.Contains(clamped, "Command failed") || !strings.Contains(clamped, "Cause:") {
+		t.Errorf("clampHeight dropped failure lines:\n%s", clamped)
+	}
+}

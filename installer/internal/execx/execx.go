@@ -61,7 +61,7 @@ type Runner interface {
 
 var ansi = regexp.MustCompile(`\x1b\[[0-9;]*[A-Za-z]`)
 
-const maxLineLen = 400
+const maxLineLen = 2000
 
 // clean strips ANSI color codes and truncates pathological lines.
 func clean(line string) string {
@@ -74,14 +74,21 @@ func clean(line string) string {
 }
 
 // Real executes commands with os/exec.
-type Real struct{}
+type Real struct {
+	Log *Logger
+}
 
 // Start runs the command and streams its combined output line by line. The
 // channel is closed after the Done event.
-func (Real) Start(ctx context.Context, spec Spec) <-chan Event {
+func (r Real) Start(ctx context.Context, spec Spec) <-chan Event {
 	ch := make(chan Event, 64)
 	go func() {
 		defer close(ch)
+
+		start := time.Now()
+		if r.Log != nil {
+			r.Log.LogCommandStart(spec)
+		}
 
 		cmd := exec.CommandContext(ctx, spec.Argv[0], spec.Argv[1:]...)
 		cmd.Dir = spec.Dir
@@ -89,26 +96,39 @@ func (Real) Start(ctx context.Context, spec Spec) <-chan Event {
 
 		stdout, err := cmd.StdoutPipe()
 		if err != nil {
+			if r.Log != nil {
+				r.Log.LogCommandEnd(spec, err, time.Since(start))
+			}
 			ch <- Event{Done: true, Err: err}
 			return
 		}
 		stderr, err := cmd.StderrPipe()
 		if err != nil {
+			if r.Log != nil {
+				r.Log.LogCommandEnd(spec, err, time.Since(start))
+			}
 			ch <- Event{Done: true, Err: err}
 			return
 		}
 		if err := cmd.Start(); err != nil {
+			if r.Log != nil {
+				r.Log.LogCommandEnd(spec, err, time.Since(start))
+			}
 			ch <- Event{Done: true, Err: err}
 			return
 		}
 
 		var wg sync.WaitGroup
-		scan := func(r io.Reader) {
+		scan := func(rd io.Reader) {
 			defer wg.Done()
-			sc := bufio.NewScanner(r)
+			sc := bufio.NewScanner(rd)
 			sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 			for sc.Scan() {
-				if line := clean(sc.Text()); line != "" {
+				raw := sc.Text()
+				if r.Log != nil {
+					r.Log.LogLine(raw)
+				}
+				if line := clean(raw); line != "" {
 					ch <- Event{Line: line}
 				}
 			}
@@ -118,7 +138,11 @@ func (Real) Start(ctx context.Context, spec Spec) <-chan Event {
 		go scan(stderr)
 		wg.Wait()
 
-		ch <- Event{Done: true, Err: cmd.Wait()}
+		waitErr := cmd.Wait()
+		if r.Log != nil {
+			r.Log.LogCommandEnd(spec, waitErr, time.Since(start))
+		}
+		ch <- Event{Done: true, Err: waitErr}
 	}()
 	return ch
 }
@@ -127,6 +151,7 @@ func (Real) Start(ctx context.Context, spec Spec) <-chan Event {
 type DryRun struct {
 	// Delay between replayed lines; defaults to 250ms.
 	Delay time.Duration
+	Log   *Logger
 }
 
 // Start replays spec.SimLines and finishes successfully.
@@ -138,15 +163,31 @@ func (d DryRun) Start(ctx context.Context, spec Spec) <-chan Event {
 	ch := make(chan Event, 64)
 	go func() {
 		defer close(ch)
+		start := time.Now()
+		if d.Log != nil {
+			d.Log.LogCommandStart(spec)
+		}
 		ch <- Event{Line: "(dry-run) " + spec.Display}
+		if d.Log != nil {
+			d.Log.LogLine("(dry-run) " + spec.Display)
+		}
 		for _, line := range spec.SimLines {
 			select {
 			case <-ctx.Done():
+				if d.Log != nil {
+					d.Log.LogCommandEnd(spec, ctx.Err(), time.Since(start))
+				}
 				ch <- Event{Done: true, Err: ctx.Err()}
 				return
 			case <-time.After(delay):
 			}
+			if d.Log != nil {
+				d.Log.LogLine(line)
+			}
 			ch <- Event{Line: line}
+		}
+		if d.Log != nil {
+			d.Log.LogCommandEnd(spec, nil, time.Since(start))
 		}
 		ch <- Event{Done: true}
 	}()

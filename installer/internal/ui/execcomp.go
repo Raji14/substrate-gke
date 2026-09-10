@@ -38,9 +38,10 @@ const logTail = 8
 // execComp runs one external command and renders a live checklist over its
 // streamed output. It replaces the prototype's timer-driven fake checklist.
 type execComp struct {
-	runner execx.Runner
-	spec   execx.Spec
-	items  []steps.ChecklistItem
+	runner  execx.Runner
+	spec    execx.Spec
+	items   []steps.ChecklistItem
+	logPath string
 
 	started  bool
 	finished bool
@@ -54,6 +55,57 @@ type execComp struct {
 
 func newExecComp(runner execx.Runner, spec execx.Spec, items []steps.ChecklistItem) *execComp {
 	return &execComp{runner: runner, spec: spec, items: items, active: -1}
+}
+
+func (c *execComp) withLogPath(path string) *execComp {
+	if c != nil {
+		c.logPath = path
+	}
+	return c
+}
+
+func (c *execComp) LogLines() []string {
+	if c == nil {
+		return nil
+	}
+	return c.lines
+}
+
+func (c *execComp) LogTitle() string {
+	if c == nil {
+		return ""
+	}
+	return c.spec.Display
+}
+
+var errKeywords = []string{
+	"error:", "Error:", "ERROR",
+	"fatal:", "Fatal:", "FATAL",
+	"failed:", "Failed:", "FAILED",
+	"denied", "forbidden", "Forbidden",
+	"Unauthorized", "unauthorized",
+	"NotFound", "not found", "does not exist",
+	"exceeded", "timed out", "timeout",
+	"cannot ", "Cannot ",
+}
+
+func findErrorSnippet(lines []string) string {
+	for i := len(lines) - 1; i >= 0; i-- {
+		line := strings.TrimSpace(lines[i])
+		if line == "" {
+			continue
+		}
+		if strings.HasPrefix(line, "exit status ") || strings.HasPrefix(line, "make: ***") {
+			continue
+		}
+		lower := strings.ToLower(line)
+		for _, kw := range errKeywords {
+			if strings.Contains(lower, strings.ToLower(kw)) {
+				return line
+			}
+		}
+	}
+	return ""
 }
 
 func (c *execComp) start() tea.Cmd {
@@ -112,8 +164,8 @@ func (c *execComp) update(msg tea.Msg) (cmd tea.Cmd, handled bool) {
 			return nil, true
 		}
 		c.lines = append(c.lines, m.ev.Line)
-		if len(c.lines) > 200 {
-			c.lines = c.lines[len(c.lines)-200:]
+		if len(c.lines) > 5000 {
+			c.lines = c.lines[len(c.lines)-5000:]
 		}
 		c.active = steps.Progress(c.items, c.active, m.ev.Line)
 		return c.read(), true
@@ -161,9 +213,16 @@ func (c *execComp) view(w int) string {
 	}
 
 	if c.failed != nil {
-		b.WriteString(theme.ErrorPanel.Width(w-4).Render(
-			theme.Bad.Render("Command failed: ")+c.failed.Error()+"\n"+
-				theme.Subtle.Render("The full output is below; press [r] to retry.")) + "\n")
+		var panel strings.Builder
+		panel.WriteString(theme.Bad.Render("Command failed: ") + c.failed.Error())
+		if snippet := findErrorSnippet(c.lines); snippet != "" && snippet != c.failed.Error() {
+			panel.WriteString("\n\n" + theme.Warning.Render("Cause: ") + theme.Subtle.Render(snippet))
+		}
+		panel.WriteString("\n\n" + theme.Subtle.Render("Press ") + theme.Key.Render("[v]") + theme.Subtle.Render(" to view full log, ") + theme.Key.Render("[r]") + theme.Subtle.Render(" to retry."))
+		if c.logPath != "" {
+			panel.WriteString("\n" + theme.Subtle.Render("Log file: ") + theme.Accent.Render(c.logPath))
+		}
+		b.WriteString(theme.ErrorPanel.Width(w-4).Render(panel.String()) + "\n")
 	}
 
 	if len(c.lines) > 0 {
@@ -173,9 +232,6 @@ func (c *execComp) view(w int) string {
 		}
 		var log strings.Builder
 		for i, line := range tail {
-			if lw := w - 8; lw > 10 && len(line) > lw {
-				line = line[:lw] + "…"
-			}
 			log.WriteString(theme.Subtle.Render(line))
 			if i < len(tail)-1 {
 				log.WriteString("\n")

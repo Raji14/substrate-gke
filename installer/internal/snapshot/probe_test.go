@@ -138,9 +138,16 @@ func TestCheckInstalled(t *testing.T) {
 		t.Error("ParseInstalled should fail when marker is missing")
 	}
 
-	// Dry run replays false
+	// The dry run replays clean for ordinary names, and the guard's other
+	// two states for the fixture clusters named after them.
 	if p, err := ParseInstalled(CheckInstalled("acme", "substrate-test", "us-west1-c").SimLines); err != nil || p.Installed {
 		t.Fatalf("dry-run check installed = %+v, %v; want not installed", p, err)
+	}
+	if p, err := ParseInstalled(CheckInstalled("acme", "substrate-installed", "us-west1-c").SimLines); err != nil || !p.Installed || p.Partial() {
+		t.Fatalf("dry-run check of the installed fixture = %+v, %v; want installed with a version", p, err)
+	}
+	if p, err := ParseInstalled(CheckInstalled("acme", "substrate-partial", "us-west1-c").SimLines); err != nil || !p.Partial() {
+		t.Fatalf("dry-run check of the partial fixture = %+v, %v; want partial", p, err)
 	}
 
 	spec := CheckInstalled("acme", "substrate-test", "us-west1-c")

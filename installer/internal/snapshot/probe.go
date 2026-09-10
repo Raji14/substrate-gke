@@ -97,13 +97,21 @@ func CheckInstalled(projectID, cluster, location string) execx.Spec {
 		fmt.Sprintf(`  echo "%sfalse"`, installedMarker),
 		`fi`,
 	)
+	// The dry run keeps the guard's whole story on display: the fixture
+	// clusters named for it replay an installed and a partial answer, the
+	// rest come back clean.
+	sim := installedMarker + "false"
+	switch {
+	case strings.Contains(cluster, "installed"):
+		sim = installedMarker + "true substrate-" + ShortCommit()
+	case strings.Contains(cluster, "partial"):
+		sim = installedMarker + "true"
+	}
 	return execx.Spec{
-		Label:   "check for existing Substrate installation",
-		Display: "gcloud container clusters get-credentials " + cluster + " && kubectl get namespace ate-system",
-		Argv:    []string{"bash", "-c", strings.Join(lines, "\n")},
-		SimLines: []string{
-			installedMarker + "false",
-		},
+		Label:    "check for existing Substrate installation",
+		Display:  "gcloud container clusters get-credentials " + cluster + " && kubectl get namespace ate-system",
+		Argv:     []string{"bash", "-c", strings.Join(lines, "\n")},
+		SimLines: []string{sim},
 	}
 }
 

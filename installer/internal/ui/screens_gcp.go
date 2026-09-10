@@ -451,6 +451,13 @@ func (s *clusterScreen) Update(msg tea.Msg) tea.Cmd {
 				case "teardown":
 					// The cluster just changed; the cached verdict did not.
 					s.parsed = true
+					if s.deps.DryRun {
+						// The sim would replay "installed" forever; the
+						// simulated teardown's story is a clean cluster.
+						c := s.clusters[s.cursor]
+						s.probed[c.Name+"/"+c.Location] = snapshot.InstalledProbe{}
+						return s.decide(c, snapshot.InstalledProbe{})
+					}
 					return s.reprobe()
 				}
 			}

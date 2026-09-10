@@ -195,9 +195,9 @@ func TestCreateNewClusterPath(t *testing.T) {
 
 	press("enter")                            // welcome
 	press("enter")                            // doctor
-	press("enter", "enter", "enter", "enter") // images: pre-built, then its three fields
+	press("enter", "enter", "enter", "enter") // images: pre-built (the default), then its three fields
 	press("enter", "enter", "enter")          // project fields (pid, zone, bucket)
-	press("3", "enter")                       // "create a new cluster" row (2 clusters + create)
+	press("5", "enter")                       // "create a new cluster" row (4 clusters + create)
 	pump(t, app, key("enter"))                // accept the default name
 	if app.mach.Current() != state.Provision {
 		t.Fatalf("after cluster create: %v", app.mach.Current())
@@ -956,10 +956,10 @@ func TestClusterScreenBlocksAlreadyInstalledCluster(t *testing.T) {
 	calls := 0
 	app.deps.Runner = installedClusterRunner{inner: execx.DryRun{Delay: time.Millisecond}, versions: "substrate-71e7623", calls: &calls}
 	press := pressToCluster(t, app)
-	// The list load already background-probed the one substrate-ready
-	// cluster; legacy-prod is not ready, so selecting it probes fresh.
-	if calls != 1 {
-		t.Fatalf("background probes on load = %d, want 1", calls)
+	// The list load already background-probed the three substrate-ready
+	// clusters; legacy-prod is not ready, so selecting it probes fresh.
+	if calls != 3 {
+		t.Fatalf("background probes on load = %d, want 3", calls)
 	}
 
 	press("2", "enter") // pick legacy-prod (us-central1)
@@ -1003,13 +1003,13 @@ func TestClusterScreenBlocksAlreadyInstalledCluster(t *testing.T) {
 	// Re-selecting the same cluster answers from the cache instead of paying
 	// another gcloud+kubectl round trip.
 	press("enter")
-	if scr.mode != "installed" || calls != 2 {
-		t.Errorf("re-selection: mode=%q probes=%d, want installed from cache after 2 probes", scr.mode, calls)
+	if scr.mode != "installed" || calls != 4 {
+		t.Errorf("re-selection: mode=%q probes=%d, want installed from cache after 4 probes", scr.mode, calls)
 	}
 	// Pressing 'r' invalidates the cache and re-probes.
 	press("r")
-	if scr.mode != "installed" || calls != 3 {
-		t.Errorf("re-probe: mode=%q probes=%d, want installed after 3 probes", scr.mode, calls)
+	if scr.mode != "installed" || calls != 5 {
+		t.Errorf("re-probe: mode=%q probes=%d, want installed after 5 probes", scr.mode, calls)
 	}
 }
 
@@ -1023,11 +1023,74 @@ func TestListBackgroundProbesReadyClusters(t *testing.T) {
 	app.deps.Runner = installedClusterRunner{inner: execx.DryRun{Delay: time.Millisecond}, versions: "substrate-0b3d2d078f64", calls: &calls}
 	pressToCluster(t, app)
 
-	if calls != 1 {
-		t.Fatalf("background probes = %d, want 1 (only the substrate-ready cluster)", calls)
+	if calls != 3 {
+		t.Fatalf("background probes = %d, want 3 (only the substrate-ready clusters)", calls)
 	}
 	if view := app.View(); !strings.Contains(view, "substrate installed") {
 		t.Errorf("list row missing the background-probed badge:\n%s", view)
+	}
+}
+
+// A --dry-run walkthrough shows the guard's whole story off the fixture
+// clusters: badges from the background probes, the blocked panel, and a
+// simulated teardown that ends clean instead of replaying "installed".
+func TestDryRunShowsGuardStates(t *testing.T) {
+	app := testApp(t)
+	press := pressToCluster(t, app)
+
+	view := app.View()
+	for _, want := range []string{"substrate installed", "partial install"} {
+		if !strings.Contains(view, want) {
+			t.Errorf("dry-run list missing %q badge:\n%s", want, view)
+		}
+	}
+	press("3", "enter") // substrate-installed
+	scr := app.cur.(*clusterScreen)
+	if scr.mode != "installed" {
+		t.Fatalf("mode = %q, want installed", scr.mode)
+	}
+	press("t", "y") // simulated teardown, then the install continues
+	if app.mach.Current() != state.Provision || app.deps.Setup.ClusterName != "substrate-installed" {
+		t.Errorf("after dry-run teardown: step=%v cluster=%q, want Provision/substrate-installed",
+			app.mach.Current(), app.deps.Setup.ClusterName)
+	}
+}
+
+// Outside --dry-run the teardown must re-probe for real: the runner flips to
+// clean only after the delete spec has run, and the screen has to see that
+// rather than assume it.
+func TestTeardownReprobesForReal(t *testing.T) {
+	deps := &Deps{
+		Setup:   state.NewSetup(),
+		Runner:  &teardownClusterRunner{inner: execx.DryRun{Delay: time.Millisecond}},
+		GCP:     &gcp.Client{DryRun: true},
+		Builder: snapshot.NewBuilder(t.TempDir(), false),
+	}
+	deps.Setup.ProjectID = "acme"
+	s := newClusterScreen(deps)
+	drive := func(msg tea.Msg) {
+		t.Helper()
+		for queue := []tea.Msg{msg}; len(queue) > 0; {
+			m := queue[0]
+			queue = queue[1:]
+			queue = append(queue, runCmd(s.Update(m))...)
+		}
+	}
+	clusters, err := deps.GCP.ListClusters(context.Background(), "acme")
+	if err != nil {
+		t.Fatal(err)
+	}
+	drive(clustersMsg{owner: s, clusters: clusters})
+	s.cursor = 0 // substrate-poc, background-probed as installed
+	drive(key("enter"))
+	if s.mode != "installed" {
+		t.Fatalf("mode = %q, want installed", s.mode)
+	}
+	drive(key("t"))
+	drive(key("y"))
+	if deps.Setup.ClusterName != "substrate-poc" {
+		t.Errorf("teardown+reprobe: mode=%q cluster=%q, want substrate-poc chosen after the clean reprobe",
+			s.mode, deps.Setup.ClusterName)
 	}
 }
 

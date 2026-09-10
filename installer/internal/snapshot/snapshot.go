@@ -54,9 +54,13 @@ const (
 	// build-from-source track offers its repository's live HEAD instead and
 	// only falls back here for --dry-run, which resolves nothing.
 	//
+	// It is a release commit rather than a commit of main, because that is
+	// what the released images are built from: the commit upstream's v0.1.0
+	// tag names, ReleaseVersion being the GKE build of that release.
+	//
 	// Bump this to move to a newer Substrate, and update MinGoVersion to
 	// match the `go` directive in that revision's go.mod.
-	Commit = "cbae8250a5ff157e1ec69618804b07b825cdf52c"
+	Commit = "fa6d949685a6318940a9a0195c867c864009b820"
 
 	// MinGoVersion mirrors the `go` directive in go.mod at Commit. The doctor
 	// prefers the real go.mod once the tree is on disk and falls back to this
@@ -79,7 +83,7 @@ const (
 	// never has to fall back to building from source. It asks such a team for
 	// a manifest revision as well, since only this registry is published
 	// alongside a tree known to match.
-	ReleaseVersion = "v0.1.0"
+	ReleaseVersion = "v0.1.0-gke.1"
 )
 
 // ShortCommit is Commit abbreviated for display.

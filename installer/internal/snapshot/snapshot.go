@@ -314,6 +314,26 @@ func (b *Builder) TeardownCommand(st *state.Setup, root string) string {
 	return b.inEphemeralTree(del)
 }
 
+// DeleteAteSystem removes the Substrate control plane from the named cluster
+// with upstream's ate-setup, keeping the cluster and its snapshot bucket. The
+// wizard offers it from the install guard's blocked panel, so like
+// CheckInstalled it takes the cluster by name: the selection is not committed
+// to Setup yet. The env rides inside the command like TeardownCommand's, so
+// the delete can only hit the cluster it names, never an ambient context.
+func (b *Builder) DeleteAteSystem(projectID, cluster, location string) execx.Spec {
+	env := fmt.Sprintf("PROJECT_ID=%s CLUSTER_NAME=%s CLUSTER_LOCATION=%s NO_DEV_ENV=1",
+		ShellQuote(projectID), ShellQuote(cluster), ShellQuote(location))
+	return execx.Spec{
+		Label:   "ate-setup delete ate-system",
+		Display: "go run ./cmd/ate-setup delete ate-system",
+		Argv:    b.inTree(env + " go run ./cmd/ate-setup delete ate-system"),
+		SimLines: append(b.fetchSimLines(),
+			"[step]: delete_ate_system",
+			`namespace "ate-system" deleted`,
+		),
+	}
+}
+
 // KubectlAteInstall returns the command that installs the kubectl-ate plugin
 // at the revision this install used, for machines where the managed checkout
 // is already gone. It has to build from a checkout: `go install

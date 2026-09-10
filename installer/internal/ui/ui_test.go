@@ -1027,6 +1027,63 @@ func TestTypedInstalledClusterNameIsStillGuarded(t *testing.T) {
 	}
 }
 
+// teardownClusterRunner reports the cluster installed until a teardown spec
+// has run, then clean — the runner-side view of [t] from the blocked panel.
+type teardownClusterRunner struct {
+	inner execx.Runner
+	torn  bool
+}
+
+func (r *teardownClusterRunner) Start(ctx context.Context, spec execx.Spec) <-chan execx.Event {
+	switch spec.Label {
+	case "ate-setup delete ate-system":
+		r.torn = true
+	case "check for existing Substrate installation":
+		line := "SUBSTRATE_GKE_INSTALLED true substrate-0b3d2d078f64"
+		if r.torn {
+			line = "SUBSTRATE_GKE_INSTALLED false"
+		}
+		ch := make(chan execx.Event, 2)
+		ch <- execx.Event{Line: line}
+		ch <- execx.Event{Done: true}
+		close(ch)
+		return ch
+	}
+	return r.inner.Start(ctx, spec)
+}
+
+// The blocked panel can run the teardown itself: [t] asks, [y] deletes the
+// control plane (keeping the cluster), the guard re-probes, and the install
+// continues on the now-clean cluster without leaving the wizard.
+func TestInstalledClusterTeardownFromWizard(t *testing.T) {
+	app := testApp(t)
+	app.deps.Runner = &teardownClusterRunner{inner: execx.DryRun{Delay: time.Millisecond}}
+	press := pressToCluster(t, app)
+
+	press("1", "enter") // substrate-poc, reported installed
+	scr := app.cur.(*clusterScreen)
+	if scr.mode != "installed" {
+		t.Fatalf("mode = %q, want installed", scr.mode)
+	}
+	press("t")
+	if scr.mode != "teardown-confirm" {
+		t.Fatalf("mode = %q, want teardown-confirm", scr.mode)
+	}
+	if view := app.View(); !strings.Contains(view, "delete ate-system") {
+		t.Errorf("confirm view does not say what it runs:\n%s", view)
+	}
+	// Backing out returns to the blocked panel, not the list.
+	pump(t, app, tea.KeyMsg{Type: tea.KeyEsc})
+	if scr.mode != "installed" {
+		t.Fatalf("after esc: mode = %q, want installed", scr.mode)
+	}
+	press("t", "y") // tear down, re-probe clean, continue the install
+	if app.mach.Current() != state.Provision || app.deps.Setup.ClusterName != "substrate-poc" {
+		t.Errorf("after teardown: step=%v cluster=%q, want Provision/substrate-poc",
+			app.mach.Current(), app.deps.Setup.ClusterName)
+	}
+}
+
 // A bare ate-system namespace with no atelet is an interrupted install, not
 // a running one; upstream's deploy is documented idempotent, so the screen
 // asks instead of hard-blocking with teardown as the only exit.

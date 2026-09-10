@@ -262,7 +262,8 @@ type clusterScreen struct {
 	// mode: "list", "name" (new-cluster name input), "probing" (checking
 	// cluster for existing install), "installed" (cluster already runs
 	// Substrate), "partial" (ate-system namespace without atelet),
-	// "confirm" (incompatible cluster chosen).
+	// "teardown-confirm"/"teardown" (deleting the control plane so the
+	// install can continue here), "confirm" (incompatible cluster chosen).
 	mode              string
 	nameInput         textinput.Model
 	comp              *execComp
@@ -305,9 +306,16 @@ func (s *clusterScreen) Hints() []Hint {
 		}
 		return []Hint{{"esc", "cancel"}}
 	case "installed":
-		return []Hint{{"r", "re-probe"}, {"esc", "choose another"}}
+		return []Hint{{"t", "tear down and reinstall"}, {"r", "re-probe"}, {"esc", "choose another"}}
 	case "partial":
 		return []Hint{{"y", "continue"}, {"r", "re-probe"}, {"esc", "choose another"}}
+	case "teardown-confirm":
+		return []Hint{{"y", "tear it down"}, {"esc", "back"}}
+	case "teardown":
+		if s.comp != nil && s.comp.failed != nil {
+			return []Hint{{"r", "retry"}, {"esc", "back to list"}}
+		}
+		return []Hint{{"esc", "cancel"}}
 	case "confirm":
 		return []Hint{{"y", "use it anyway"}, {"esc", "choose another"}}
 	}
@@ -387,9 +395,16 @@ func (s *clusterScreen) Stop() {
 func (s *clusterScreen) Update(msg tea.Msg) tea.Cmd {
 	if s.comp != nil {
 		if cmd, handled := s.comp.update(msg); handled {
-			if s.comp.ok() && s.mode == "probing" && !s.parsed {
-				s.parsed = true
-				return s.probeDone()
+			if s.comp.ok() && !s.parsed {
+				switch s.mode {
+				case "probing":
+					s.parsed = true
+					return s.probeDone()
+				case "teardown":
+					// The cluster just changed; the cached verdict did not.
+					s.parsed = true
+					return s.reprobe()
+				}
 			}
 			return cmd
 		}
@@ -472,7 +487,44 @@ func (s *clusterScreen) Update(msg tea.Msg) tea.Cmd {
 				if s.mode == "partial" {
 					return s.decide(s.clusters[s.cursor], snapshot.InstalledProbe{})
 				}
+			case "t":
+				if s.mode == "installed" {
+					s.mode = "teardown-confirm"
+					return nil
+				}
 			case "b", "esc":
+				s.mode = "list"
+				return nil
+			}
+			return nil
+
+		case "teardown-confirm":
+			switch key {
+			case "y":
+				c := s.clusters[s.cursor]
+				s.mode, s.parsed = "teardown", false
+				s.comp = newExecComp(s.deps.Runner,
+					s.deps.Builder.DeleteAteSystem(s.deps.Setup.ProjectID, c.Name, c.Location), nil, s.deps.LogPath)
+				return s.comp.start()
+			case "b", "esc":
+				s.mode = "installed"
+				return nil
+			}
+			return nil
+
+		case "teardown":
+			switch key {
+			case "r":
+				if s.comp != nil && s.comp.failed != nil {
+					s.parsed = false
+					return s.comp.restart()
+				}
+			case "b", "esc":
+				if s.comp != nil {
+					s.comp.stop()
+				}
+				// The teardown may have half-run; the cached "installed"
+				// verdict is the safe answer until the user re-probes.
 				s.mode = "list"
 				return nil
 			}
@@ -583,10 +635,25 @@ func (s *clusterScreen) View(w int) string {
 				theme.Title.Render("Supported paths forward:")+"\n"+
 				"  1. Upgrade this cluster: exit or restart the installer and choose\n"+
 				"     \"Upgrade an installed cluster\" to follow the rolling upgrade runbook.\n\n"+
-				"  2. Teardown and reinstall: tear down the existing deployment first with:\n"+
+				"  2. Tear down and reinstall: press "+theme.Key.Render("[t]")+" to delete the Substrate control\n"+
+				"     plane on this cluster now (the cluster and its snapshots are kept)\n"+
+				"     and continue the install here. For the full GCP cleanup — cluster,\n"+
+				"     bucket, IAM, dashboards — run instead:\n"+
 				"     "+snapshot.CleanupCommand(s.deps.Setup.ProjectID, sel.Name, sel.Location, "")+"\n"+
 				"     (--bucket: the snapshot bucket that install used)\n\n"+
-				theme.Key.Render("[esc]")+" choose another cluster   "+theme.Key.Render("[r]")+" re-probe"))
+				theme.Key.Render("[t]")+" tear down here   "+theme.Key.Render("[esc]")+" choose another   "+theme.Key.Render("[r]")+" re-probe"))
+	case "teardown-confirm":
+		sel := s.clusters[s.cursor]
+		b.WriteString("\n" + theme.ErrorPanel.Width(min(w-4, 76)).Render(
+			theme.Warning.Render(fmt.Sprintf("Tear down Substrate on %q?", sel.Name))+"\n\n"+
+				"Runs `ate-setup delete ate-system` against the cluster: the control\n"+
+				"plane and every running actor are deleted. The cluster, its nodes,\n"+
+				"and the snapshot bucket are kept. The install then continues here.\n\n"+
+				theme.Key.Render("[y]")+" tear it down   "+theme.Key.Render("[esc]")+" back"))
+	case "teardown":
+		sel := s.clusters[s.cursor]
+		b.WriteString("\n" + theme.Subtle.Render(fmt.Sprintf("Tearing down Substrate on %s…", sel.Name)) + "\n\n")
+		b.WriteString(s.comp.view(w))
 	case "partial":
 		sel := s.clusters[s.cursor]
 		b.WriteString("\n" + theme.ErrorPanel.Width(min(w-4, 76)).Render(

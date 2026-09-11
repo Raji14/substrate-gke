@@ -223,6 +223,32 @@ func TestTeardownCommandStandsAlone(t *testing.T) {
 	}
 }
 
+// The wizard's in-place teardown carries the cluster in its own env, so it
+// can only ever delete from the cluster it names, never whatever context is
+// ambient — and a cluster name with a space must not split it.
+func TestDeleteAteSystemNamesTheCluster(t *testing.T) {
+	spec := NewBuilder("/tmp/substrate-pin", true).DeleteAteSystem("acme", "prod cluster", "us-west1-c")
+	script := spec.Argv[len(spec.Argv)-1]
+	for _, want := range []string{
+		"PROJECT_ID=" + ShellQuote("acme"),
+		"CLUSTER_NAME=" + ShellQuote("prod cluster"),
+		"CLUSTER_LOCATION=" + ShellQuote("us-west1-c"),
+		"NO_DEV_ENV=1 go run ./cmd/ate-setup delete ate-system",
+		// ate-setup returns while the namespace is still deleting; the
+		// teardown must outlast it, or the immediate re-probe reads (and
+		// caches) the half-deleted install as still installed.
+		"kubectl wait --for=delete namespace/ate-system",
+		`KUBECONFIG=$(mktemp)`,
+	} {
+		if !strings.Contains(script, want) {
+			t.Errorf("delete script missing %q:\n%s", want, script)
+		}
+	}
+	if err := exec.Command("bash", "-n", "-c", script).Run(); err != nil {
+		t.Errorf("delete script is not valid shell: %v\n%s", err, script)
+	}
+}
+
 // The kubectl-ate install has the same constraints as the teardown — the
 // managed checkout is gone by the time the user reads it — plus one of its
 // own: it cannot be `go install <module>@<pin>`, which Go refuses for this

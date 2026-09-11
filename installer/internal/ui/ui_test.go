@@ -195,9 +195,9 @@ func TestCreateNewClusterPath(t *testing.T) {
 
 	press("enter")                            // welcome
 	press("enter")                            // doctor
-	press("enter", "enter", "enter", "enter") // images: pre-built, then its three fields
+	press("enter", "enter", "enter", "enter") // images: pre-built (the default), then its three fields
 	press("enter", "enter", "enter")          // project fields (pid, zone, bucket)
-	press("3", "enter")                       // "create a new cluster" row (2 clusters + create)
+	press("5", "enter")                       // "create a new cluster" row (4 clusters + create)
 	pump(t, app, key("enter"))                // accept the default name
 	if app.mach.Current() != state.Provision {
 		t.Fatalf("after cluster create: %v", app.mach.Current())
@@ -958,6 +958,11 @@ func TestClusterScreenBlocksAlreadyInstalledCluster(t *testing.T) {
 	calls := 0
 	app.deps.Runner = installedClusterRunner{inner: execx.DryRun{Delay: time.Millisecond}, versions: "substrate-71e7623", calls: &calls}
 	press := pressToCluster(t, app)
+	// The list load already background-probed the three substrate-ready
+	// clusters; legacy-prod is not ready, so selecting it probes fresh.
+	if calls != 3 {
+		t.Fatalf("background probes on load = %d, want 3", calls)
+	}
 
 	press("2", "enter") // pick legacy-prod (us-central1)
 	// Must NOT advance to Provision! Must stay at Cluster and enter "installed" mode
@@ -992,16 +997,102 @@ func TestClusterScreenBlocksAlreadyInstalledCluster(t *testing.T) {
 		t.Errorf("aborted selection leaked into Setup: cluster=%q zone=%q bucket=%q",
 			st.ClusterName, st.Zone, st.BucketName)
 	}
+	// Back in the list, the probe's verdict is visible on the row — distinct
+	// from the "substrate-ready" capability badge, which rightly stays.
+	if view := app.View(); !strings.Contains(view, "substrate installed") {
+		t.Errorf("list row missing the installed badge:\n%s", view)
+	}
 	// Re-selecting the same cluster answers from the cache instead of paying
 	// another gcloud+kubectl round trip.
 	press("enter")
-	if scr.mode != "installed" || calls != 1 {
-		t.Errorf("re-selection: mode=%q probes=%d, want installed from cache after 1 probe", scr.mode, calls)
+	if scr.mode != "installed" || calls != 4 {
+		t.Errorf("re-selection: mode=%q probes=%d, want installed from cache after 4 probes", scr.mode, calls)
 	}
 	// Pressing 'r' invalidates the cache and re-probes.
 	press("r")
-	if scr.mode != "installed" || calls != 2 {
-		t.Errorf("re-probe: mode=%q probes=%d, want installed after 2 probes", scr.mode, calls)
+	if scr.mode != "installed" || calls != 5 {
+		t.Errorf("re-probe: mode=%q probes=%d, want installed after 5 probes", scr.mode, calls)
+	}
+}
+
+// The list learns install state on its own: substrate-ready clusters are
+// probed in the background as the list loads, so their rows carry a badge
+// without the user selecting anything. Not-ready clusters are skipped —
+// they cannot take an install, so their state decides nothing.
+func TestListBackgroundProbesReadyClusters(t *testing.T) {
+	app := testApp(t)
+	calls := 0
+	app.deps.Runner = installedClusterRunner{inner: execx.DryRun{Delay: time.Millisecond}, versions: "substrate-0b3d2d078f64", calls: &calls}
+	pressToCluster(t, app)
+
+	if calls != 3 {
+		t.Fatalf("background probes = %d, want 3 (only the substrate-ready clusters)", calls)
+	}
+	if view := app.View(); !strings.Contains(view, "substrate installed") {
+		t.Errorf("list row missing the background-probed badge:\n%s", view)
+	}
+}
+
+// A --dry-run walkthrough shows the guard's whole story off the fixture
+// clusters: badges from the background probes, the blocked panel, and a
+// simulated teardown that ends clean instead of replaying "installed".
+func TestDryRunShowsGuardStates(t *testing.T) {
+	app := testApp(t)
+	press := pressToCluster(t, app)
+
+	view := app.View()
+	for _, want := range []string{"substrate installed", "partial install"} {
+		if !strings.Contains(view, want) {
+			t.Errorf("dry-run list missing %q badge:\n%s", want, view)
+		}
+	}
+	press("3", "enter") // substrate-installed
+	scr := app.cur.(*clusterScreen)
+	if scr.mode != "installed" {
+		t.Fatalf("mode = %q, want installed", scr.mode)
+	}
+	press("t", "y") // simulated teardown, then the install continues
+	if app.mach.Current() != state.Provision || app.deps.Setup.ClusterName != "substrate-installed" {
+		t.Errorf("after dry-run teardown: step=%v cluster=%q, want Provision/substrate-installed",
+			app.mach.Current(), app.deps.Setup.ClusterName)
+	}
+}
+
+// Outside --dry-run the teardown must re-probe for real: the runner flips to
+// clean only after the delete spec has run, and the screen has to see that
+// rather than assume it.
+func TestTeardownReprobesForReal(t *testing.T) {
+	deps := &Deps{
+		Setup:   state.NewSetup(),
+		Runner:  &teardownClusterRunner{inner: execx.DryRun{Delay: time.Millisecond}},
+		GCP:     &gcp.Client{DryRun: true},
+		Builder: snapshot.NewBuilder(t.TempDir(), false),
+	}
+	deps.Setup.ProjectID = "acme"
+	s := newClusterScreen(deps)
+	drive := func(msg tea.Msg) {
+		t.Helper()
+		for queue := []tea.Msg{msg}; len(queue) > 0; {
+			m := queue[0]
+			queue = queue[1:]
+			queue = append(queue, runCmd(s.Update(m))...)
+		}
+	}
+	clusters, err := deps.GCP.ListClusters(context.Background(), "acme")
+	if err != nil {
+		t.Fatal(err)
+	}
+	drive(clustersMsg{owner: s, clusters: clusters})
+	s.cursor = 0 // substrate-poc, background-probed as installed
+	drive(key("enter"))
+	if s.mode != "installed" {
+		t.Fatalf("mode = %q, want installed", s.mode)
+	}
+	drive(key("t"))
+	drive(key("y"))
+	if deps.Setup.ClusterName != "substrate-poc" {
+		t.Errorf("teardown+reprobe: mode=%q cluster=%q, want substrate-poc chosen after the clean reprobe",
+			s.mode, deps.Setup.ClusterName)
 	}
 }
 
@@ -1026,6 +1117,63 @@ func TestTypedInstalledClusterNameIsStillGuarded(t *testing.T) {
 	}
 	if app.deps.Setup.ClusterName != "substrate-test" || app.deps.Setup.ClusterIsNew {
 		t.Errorf("blocked name leaked into Setup: %q (new=%v)", app.deps.Setup.ClusterName, app.deps.Setup.ClusterIsNew)
+	}
+}
+
+// teardownClusterRunner reports the cluster installed until a teardown spec
+// has run, then clean — the runner-side view of [t] from the blocked panel.
+type teardownClusterRunner struct {
+	inner execx.Runner
+	torn  bool
+}
+
+func (r *teardownClusterRunner) Start(ctx context.Context, spec execx.Spec) <-chan execx.Event {
+	switch spec.Label {
+	case "ate-setup delete ate-system":
+		r.torn = true
+	case "check for existing Substrate installation":
+		line := "SUBSTRATE_GKE_INSTALLED true substrate-0b3d2d078f64"
+		if r.torn {
+			line = "SUBSTRATE_GKE_INSTALLED false"
+		}
+		ch := make(chan execx.Event, 2)
+		ch <- execx.Event{Line: line}
+		ch <- execx.Event{Done: true}
+		close(ch)
+		return ch
+	}
+	return r.inner.Start(ctx, spec)
+}
+
+// The blocked panel can run the teardown itself: [t] asks, [y] deletes the
+// control plane (keeping the cluster), the guard re-probes, and the install
+// continues on the now-clean cluster without leaving the wizard.
+func TestInstalledClusterTeardownFromWizard(t *testing.T) {
+	app := testApp(t)
+	app.deps.Runner = &teardownClusterRunner{inner: execx.DryRun{Delay: time.Millisecond}}
+	press := pressToCluster(t, app)
+
+	press("1", "enter") // substrate-poc, reported installed
+	scr := app.cur.(*clusterScreen)
+	if scr.mode != "installed" {
+		t.Fatalf("mode = %q, want installed", scr.mode)
+	}
+	press("t")
+	if scr.mode != "teardown-confirm" {
+		t.Fatalf("mode = %q, want teardown-confirm", scr.mode)
+	}
+	if view := app.View(); !strings.Contains(view, "delete ate-system") {
+		t.Errorf("confirm view does not say what it runs:\n%s", view)
+	}
+	// Backing out returns to the blocked panel, not the list.
+	pump(t, app, tea.KeyMsg{Type: tea.KeyEsc})
+	if scr.mode != "installed" {
+		t.Fatalf("after esc: mode = %q, want installed", scr.mode)
+	}
+	press("t", "y") // tear down, re-probe clean, continue the install
+	if app.mach.Current() != state.Provision || app.deps.Setup.ClusterName != "substrate-poc" {
+		t.Errorf("after teardown: step=%v cluster=%q, want Provision/substrate-poc",
+			app.mach.Current(), app.deps.Setup.ClusterName)
 	}
 }
 

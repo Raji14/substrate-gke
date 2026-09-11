@@ -130,11 +130,18 @@ func (c *Client) ProjectNumber(ctx context.Context, projectID string) (string, e
 // ListClusters lists the project's GKE clusters with their beta-API status.
 func (c *Client) ListClusters(ctx context.Context, projectID string) ([]Cluster, error) {
 	if c.DryRun {
+		// The last two names are cues for CheckInstalled's dry-run sim, so a
+		// --dry-run walkthrough shows the install guard's whole story:
+		// clean, blocked-installed, and partial.
 		return []Cluster{
 			{Name: "substrate-poc", Location: "us-west1-c", Status: "RUNNING",
 				MasterVersion: "1.35.5-gke.1163012", NodeCount: 2, BetaAPIs: RequiredBetaAPIs},
 			{Name: "legacy-prod", Location: "us-central1", Status: "RUNNING",
 				MasterVersion: "1.33.2-gke.100", NodeCount: 12},
+			{Name: "substrate-installed", Location: "us-west1-c", Status: "RUNNING",
+				MasterVersion: "1.35.5-gke.1163012", NodeCount: 3, BetaAPIs: RequiredBetaAPIs},
+			{Name: "substrate-partial", Location: "us-west1-c", Status: "RUNNING",
+				MasterVersion: "1.35.5-gke.1163012", NodeCount: 1, BetaAPIs: RequiredBetaAPIs},
 		}, nil
 	}
 	out, err := c.run(ctx, "container", "clusters", "list", "--project="+projectID, "--format=json")

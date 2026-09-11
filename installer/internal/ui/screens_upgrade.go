@@ -63,6 +63,7 @@ func newUpgradeSourceScreen(deps *Deps) *upgradeSourceScreen {
 
 func (s *upgradeSourceScreen) Init() tea.Cmd      { return nil }
 func (s *upgradeSourceScreen) CapturesText() bool { return s.mode == "target" || s.mode == "manual" }
+func (s *upgradeSourceScreen) logComp() *execComp { return s.comp }
 
 // Stop ends a read left running when the screen is navigated away from.
 func (s *upgradeSourceScreen) Stop() {
@@ -142,7 +143,7 @@ func (s *upgradeSourceScreen) submitTarget() tea.Cmd {
 	// Whatever an earlier read learned belonged to the cluster it named.
 	st.InstalledCommit, st.InstalledVersion, st.InstalledImageRepo, st.InstalledImageTag, st.KoDockerRepo = "", "", "", "", ""
 	s.mode, s.errText, s.fields, s.parsed = "reading", "", nil, false
-	s.comp = newExecComp(s.deps.Runner, snapshot.ProbeCluster(st, true), nil)
+	s.comp = newExecComp(s.deps.Runner, snapshot.ProbeCluster(st, true), nil, s.deps.LogPath)
 	return s.comp.start()
 }
 
@@ -349,7 +350,7 @@ func newUpgradePlanScreen(deps *Deps) *upgradePlanScreen {
 		return s
 	}
 	s.installedDir, s.nextDir = deps.Builder.UpgradeTrees(deps.UpgradeDir, st)
-	s.comp = newExecComp(deps.Runner, deps.Builder.FetchTrees(st, s.installedDir, s.nextDir), nil)
+	s.comp = newExecComp(deps.Runner, deps.Builder.FetchTrees(st, s.installedDir, s.nextDir), nil, deps.LogPath)
 	return s
 }
 
@@ -360,6 +361,7 @@ func (s *upgradePlanScreen) Init() tea.Cmd {
 	return s.comp.start()
 }
 func (s *upgradePlanScreen) CapturesText() bool { return false }
+func (s *upgradePlanScreen) logComp() *execComp { return s.comp }
 
 // Stop ends a fetch left running when the screen is navigated away from.
 func (s *upgradePlanScreen) Stop() {

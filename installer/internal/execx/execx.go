@@ -52,6 +52,8 @@ type Event struct {
 	// Done marks the final event; Err is the command error, if any.
 	Done bool
 	Err  error
+	// Stderr indicates this line originated from standard error.
+	Stderr bool
 }
 
 // Runner starts commands and streams their output.
@@ -59,29 +61,98 @@ type Runner interface {
 	Start(ctx context.Context, spec Spec) <-chan Event
 }
 
-var ansi = regexp.MustCompile(`\x1b\[[0-9;]*[A-Za-z]`)
+var (
+	ansi = regexp.MustCompile(`\x1b\[[0-9;]*[A-Za-z]`)
+	// OSC sequences (terminal titles, hyperlinks) pass the CSI-only pattern
+	// and would reprogram the terminal if re-emitted by the log viewer.
+	osc = regexp.MustCompile(`\x1b\][^\x07\x1b]*(\x07|\x1b\\)?`)
+)
 
-const maxLineLen = 400
+const maxLineLen = 2000
 
-// clean strips ANSI color codes and truncates pathological lines.
-func clean(line string) string {
-	line = ansi.ReplaceAllString(line, "")
+// Clean strips ANSI escapes, resolves in-line carriage returns, and
+// truncates pathological lines.
+func Clean(line string) string {
 	line = strings.TrimRight(line, "\r\n")
+	// Progress redraws pack "10%\r50%\r100%" into one scanner line; a
+	// terminal would show only the last segment, so keep only that —
+	// re-emitting the \r would overwrite whatever panel row it lands on.
+	if i := strings.LastIndexByte(line, '\r'); i >= 0 {
+		line = line[i+1:]
+	}
+	line = ansi.ReplaceAllString(line, "")
+	line = osc.ReplaceAllString(line, "")
 	if len(line) > maxLineLen {
 		line = line[:maxLineLen] + "…"
 	}
 	return line
 }
 
+func clean(line string) string { return Clean(line) }
+
 // Real executes commands with os/exec.
-type Real struct{}
+type Real struct {
+	Log *Logger
+
+	mu       sync.Mutex
+	lastDone chan struct{}
+	wg       sync.WaitGroup
+}
+
+// Drain waits for in-flight commands to finish draining pipes and writing logs.
+func (r *Real) Drain() {
+	if r == nil {
+		return
+	}
+	done := make(chan struct{})
+	go func() {
+		r.wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+	}
+}
 
 // Start runs the command and streams its combined output line by line. The
 // channel is closed after the Done event.
-func (Real) Start(ctx context.Context, spec Spec) <-chan Event {
+func (r *Real) Start(ctx context.Context, spec Spec) <-chan Event {
 	ch := make(chan Event, 64)
+
+	var prev <-chan struct{}
+	var done chan struct{}
+	if r != nil {
+		r.mu.Lock()
+		prev = r.lastDone
+		done = make(chan struct{})
+		r.lastDone = done
+		r.wg.Add(1)
+		r.mu.Unlock()
+	}
+
 	go func() {
 		defer close(ch)
+		if done != nil {
+			defer close(done)
+			defer r.wg.Done()
+		}
+
+		// Wait for any previous command to finish draining before logging start.
+		if prev != nil {
+			select {
+			case <-prev:
+			case <-time.After(2 * time.Second):
+			case <-ctx.Done():
+				ch <- Event{Done: true, Err: ctx.Err()}
+				return
+			}
+		}
+
+		start := time.Now()
+		if r != nil && r.Log != nil {
+			r.Log.LogCommandStart(spec)
+		}
 
 		cmd := exec.CommandContext(ctx, spec.Argv[0], spec.Argv[1:]...)
 		cmd.Dir = spec.Dir
@@ -89,36 +160,70 @@ func (Real) Start(ctx context.Context, spec Spec) <-chan Event {
 
 		stdout, err := cmd.StdoutPipe()
 		if err != nil {
+			if r != nil && r.Log != nil {
+				r.Log.LogCommandEnd(spec, err, time.Since(start))
+			}
 			ch <- Event{Done: true, Err: err}
 			return
 		}
 		stderr, err := cmd.StderrPipe()
 		if err != nil {
+			if r != nil && r.Log != nil {
+				r.Log.LogCommandEnd(spec, err, time.Since(start))
+			}
 			ch <- Event{Done: true, Err: err}
 			return
 		}
 		if err := cmd.Start(); err != nil {
+			if r != nil && r.Log != nil {
+				r.Log.LogCommandEnd(spec, err, time.Since(start))
+			}
 			ch <- Event{Done: true, Err: err}
 			return
 		}
 
 		var wg sync.WaitGroup
-		scan := func(r io.Reader) {
+		scan := func(rd io.Reader, isStderr bool) {
 			defer wg.Done()
-			sc := bufio.NewScanner(r)
+			sc := bufio.NewScanner(rd)
 			sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+			// Once the UI abandons the channel (cancel stops its reader), a
+			// blocking send would wedge this goroutine forever: the log
+			// would lose its tail and END record, Drain would always time
+			// out, and the next command's log section would interleave with
+			// this one's. Keep logging to disk; just stop feeding the
+			// channel.
+			abandoned := false
 			for sc.Scan() {
-				if line := clean(sc.Text()); line != "" {
-					ch <- Event{Line: line}
+				raw := sc.Text()
+				if r != nil && r.Log != nil {
+					r.Log.LogLine(raw)
+				}
+				if abandoned {
+					continue
+				}
+				if line := Clean(raw); line != "" {
+					select {
+					case ch <- Event{Line: line, Stderr: isStderr}:
+					case <-ctx.Done():
+						abandoned = true
+					}
 				}
 			}
 		}
 		wg.Add(2)
-		go scan(stdout)
-		go scan(stderr)
+		go scan(stdout, false)
+		go scan(stderr, true)
 		wg.Wait()
 
-		ch <- Event{Done: true, Err: cmd.Wait()}
+		waitErr := cmd.Wait()
+		if r != nil && r.Log != nil {
+			r.Log.LogCommandEnd(spec, waitErr, time.Since(start))
+		}
+		select {
+		case ch <- Event{Done: true, Err: waitErr}:
+		case <-ctx.Done():
+		}
 	}()
 	return ch
 }
@@ -127,6 +232,7 @@ func (Real) Start(ctx context.Context, spec Spec) <-chan Event {
 type DryRun struct {
 	// Delay between replayed lines; defaults to 250ms.
 	Delay time.Duration
+	Log   *Logger
 }
 
 // Start replays spec.SimLines and finishes successfully.
@@ -138,15 +244,31 @@ func (d DryRun) Start(ctx context.Context, spec Spec) <-chan Event {
 	ch := make(chan Event, 64)
 	go func() {
 		defer close(ch)
+		start := time.Now()
+		if d.Log != nil {
+			d.Log.LogCommandStart(spec)
+		}
 		ch <- Event{Line: "(dry-run) " + spec.Display}
+		if d.Log != nil {
+			d.Log.LogLine("(dry-run) " + spec.Display)
+		}
 		for _, line := range spec.SimLines {
 			select {
 			case <-ctx.Done():
+				if d.Log != nil {
+					d.Log.LogCommandEnd(spec, ctx.Err(), time.Since(start))
+				}
 				ch <- Event{Done: true, Err: ctx.Err()}
 				return
 			case <-time.After(delay):
 			}
+			if d.Log != nil {
+				d.Log.LogLine(line)
+			}
 			ch <- Event{Line: line}
+		}
+		if d.Log != nil {
+			d.Log.LogCommandEnd(spec, nil, time.Since(start))
 		}
 		ch <- Event{Done: true}
 	}()

@@ -80,6 +80,8 @@ func key(s string) tea.Msg {
 	switch s {
 	case "enter":
 		return tea.KeyMsg{Type: tea.KeyEnter}
+	case "ctrl+c":
+		return tea.KeyMsg{Type: tea.KeyCtrlC}
 	default:
 		panic("unknown key " + s)
 	}
@@ -1090,5 +1092,135 @@ func TestClusterScreenProbeFails(t *testing.T) {
 	if app.mach.Current() != state.Provision || app.deps.Setup.ClusterName != "substrate-poc" {
 		t.Errorf("continue without check: step=%v cluster=%q, want Provision/substrate-poc",
 			app.mach.Current(), app.deps.Setup.ClusterName)
+	}
+}
+
+func TestLogViewerOverlay(t *testing.T) {
+	app := testApp(t)
+	app.deps.LogPath = "/tmp/test-installer.log"
+	press := pressToCluster(t, app)
+
+	// Pick the substrate-ready cluster (1) and advance to Provision
+	press("1", "enter")
+	if app.mach.Current() != state.Provision {
+		t.Fatalf("expected Provision step, got %v", app.mach.Current())
+	}
+
+	// Press 'v' to open log viewer overlay
+	press("v")
+	if app.over != overlayLog {
+		t.Fatalf("expected overlayLog, got %v", app.over)
+	}
+	view := app.View()
+	if !strings.Contains(view, "Log:") || !strings.Contains(view, "press [esc] or [v] to close") {
+		t.Errorf("view missing log viewer chrome:\n%s", view)
+	}
+
+	// Press 'esc' to dismiss
+	pump(t, app, tea.KeyMsg{Type: tea.KeyEsc})
+	if app.over != overlayNone {
+		t.Fatalf("expected overlayNone after esc, got %v", app.over)
+	}
+
+	// Test slash command /log also opens it
+	press("/", "l", "o", "g", "enter")
+	if app.over != overlayLog {
+		t.Fatalf("expected overlayLog via /log, got %v", app.over)
+	}
+
+	// Press 'v' to toggle off
+	press("v")
+	if app.over != overlayNone {
+		t.Fatalf("expected overlayNone after v, got %v", app.over)
+	}
+
+	// Press 'v' to reopen and verify ctrl+c triggers exit modal
+	press("v")
+	if app.over != overlayLog {
+		t.Fatalf("expected overlayLog, got %v", app.over)
+	}
+	press("ctrl+c")
+	if app.over != overlayExit {
+		t.Fatalf("expected overlayExit after ctrl+c in log overlay, got %v", app.over)
+	}
+}
+
+// errorDetailRunner fails only the provision step: earlier specs (the
+// cluster probe among them) must succeed for the wizard to get there.
+type errorDetailRunner struct {
+	inner execx.Runner
+}
+
+func (r errorDetailRunner) Start(ctx context.Context, spec execx.Spec) <-chan execx.Event {
+	if spec.Label != "setup-gcp bootstrap" {
+		return r.inner.Start(ctx, spec)
+	}
+	ch := make(chan execx.Event, 4)
+	ch <- execx.Event{Line: "Step 1: initializing"}
+	ch <- execx.Event{Line: "Error from server (Forbidden): clusterrolebindings is forbidden", Stderr: true}
+	ch <- execx.Event{Line: "Cleaning up temporary resources"}
+	ch <- execx.Event{Done: true, Err: errors.New("exit status 1")}
+	close(ch)
+	return ch
+}
+
+func TestErrorSnippetAndLogPathSurfaced(t *testing.T) {
+	app := testApp(t)
+	app.deps.Runner = errorDetailRunner{inner: execx.DryRun{Delay: time.Millisecond}}
+	app.deps.LogPath = "/path/to/installer-run.log"
+	press := pressToCluster(t, app)
+
+	// Pick the substrate-ready cluster (1) and advance to Provision, which will fail with errorDetailRunner
+	press("1", "enter")
+	if app.mach.Current() != state.Provision {
+		t.Fatalf("expected Provision step, got %v", app.mach.Current())
+	}
+	scr := app.cur.(*provisionScreen)
+	if scr.comp.failed == nil {
+		t.Fatalf("expected command to fail")
+	}
+
+	view := app.View()
+	if !strings.Contains(view, "Command failed: exit status 1") {
+		t.Errorf("view missing command failed error code:\n%s", view)
+	}
+	if !strings.Contains(view, "Cause: Error from server (Forbidden): clusterrolebindings is forbidden") {
+		t.Errorf("view missing extracted cause:\n%s", view)
+	}
+	if !strings.Contains(view, "[v] to view full log") {
+		t.Errorf("view missing [v] hint in error panel:\n%s", view)
+	}
+	if !strings.Contains(view, "/path/to/installer-run.log") {
+		t.Errorf("view missing log file path:\n%s", view)
+	}
+}
+
+func TestClampHeightPreservesFailure(t *testing.T) {
+	// Realistic failure layout: Command failed with cause, hints, log path, and 10-line tail panel below it (18+ lines)
+	var b strings.Builder
+	b.WriteString("Header\nLine 1\nLine 2\nLine 3\nLine 4\n")
+	b.WriteString("Command failed: exit status 1\n")
+	b.WriteString("Cause: something went wrong\n\n")
+	b.WriteString("Press [v] to view full log, [r] to retry.\n")
+	b.WriteString("Log file: /path/to/log\n")
+	b.WriteString("╭─ Log output ────────╮\n")
+	for i := 1; i <= 8; i++ {
+		b.WriteString(fmt.Sprintf("│ tail line %d          │\n", i))
+	}
+	b.WriteString("╰─────────────────────╯\n")
+
+	content := b.String()
+	// Even when the tail panel below the banner is taller than the window,
+	// the failure-aware clamp keeps the banner and the guidance under it.
+	clamped := clampHeightAroundFailure(content, 10)
+	if !strings.Contains(clamped, "Command failed") || !strings.Contains(clamped, "Cause:") {
+		t.Errorf("clampHeightAroundFailure dropped failure lines:\n%s", clamped)
+	}
+	if !strings.Contains(clamped, "Press [v]") {
+		t.Errorf("clamp dropped the guidance below the banner:\n%s", clamped)
+	}
+	// The plain clamp keeps the top and never re-anchors on output content.
+	if plain := clampHeight(content, 3); !strings.HasPrefix(plain, "Header") {
+		t.Errorf("clampHeight no longer keeps the top:\n%s", plain)
 	}
 }

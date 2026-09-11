@@ -18,7 +18,13 @@
 package ui
 
 import (
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+
 	"github.com/charmbracelet/bubbles/textinput"
+	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
@@ -38,9 +44,15 @@ type Deps struct {
 	Builder *snapshot.Builder
 	Checks  []doctor.Check
 	DryRun  bool
+	LogPath string
 
 	// UpgradeDir is where the upgrade track keeps the two source trees.
 	UpgradeDir string
+}
+
+// execCompProvider is implemented by screens that host an execComp.
+type execCompProvider interface {
+	logComp() *execComp
 }
 
 // Screen is one wizard page. Update returns commands; navigation happens by
@@ -80,6 +92,7 @@ const (
 	overlayHelp
 	overlayExit
 	overlaySlash
+	overlayLog
 )
 
 // App is the root model.
@@ -91,7 +104,13 @@ type App struct {
 	width, height int
 	over          overlay
 	slash         textinput.Model
-	quitting      bool
+	logView       viewport.Model
+	logTitle      string
+	// logFromComp marks an overlay fed by the current screen's live
+	// component, so it can follow the stream instead of freezing at its
+	// opening snapshot.
+	logFromComp bool
+	quitting    bool
 
 	// Completed is set when the user reached the final screen.
 	Completed bool
@@ -148,6 +167,11 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch m := msg.(type) {
 	case tea.WindowSizeMsg:
 		a.width, a.height = m.Width, m.Height
+		if a.over == overlayLog {
+			bodyH := a.height - lipgloss.Height(a.headerView()) - lipgloss.Height(a.bottomView()) - 1
+			a.logView.Width = max(a.width-6, 20)
+			a.logView.Height = max(bodyH-6, 3)
+		}
 		return a, nil
 
 	case navMsg:
@@ -173,9 +197,7 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				// A screen with a command in flight ends it; the summary
 				// printed on exit describes the final screen only if the
 				// user is still there.
-				if s, ok := a.cur.(interface{ Stop() }); ok {
-					s.Stop()
-				}
+				a.stopCurrent()
 				a.Completed = false
 				a.cur = a.screenFor(step)
 				return a, a.cur.Init()
@@ -183,6 +205,7 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return a, nil
 		case navQuit:
 			a.quitting = true
+			a.stopCurrent()
 			return a, tea.Quit
 		}
 
@@ -190,7 +213,38 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return a.handleKey(m)
 	}
 
-	return a, a.cur.Update(msg)
+	cmd := a.cur.Update(msg)
+	// Command events keep flowing to the screen while the overlay is up;
+	// an overlay showing a live component follows them.
+	if a.over == overlayLog && a.logFromComp {
+		a.refreshLog()
+	}
+	return a, cmd
+}
+
+// refreshLog re-reads the live component's lines so an open overlay follows
+// a streaming command instead of freezing at its opening snapshot. The
+// scroll position is kept unless the user was at the bottom, which then
+// tracks the newest output like a tail -f.
+func (a *App) refreshLog() {
+	p, ok := a.cur.(execCompProvider)
+	if !ok || p.logComp() == nil {
+		return
+	}
+	atBottom := a.logView.AtBottom()
+	a.logView.SetContent(strings.Join(p.logComp().LogLines(), "\n"))
+	if atBottom {
+		a.logView.GotoBottom()
+	}
+}
+
+func (a *App) stopCurrent() {
+	if s, ok := a.cur.(interface{ Stop() }); ok {
+		s.Stop()
+	}
+	if p, ok := a.cur.(execCompProvider); ok && p.logComp() != nil {
+		p.logComp().stop()
+	}
 }
 
 func (a *App) handleKey(m tea.KeyMsg) (tea.Model, tea.Cmd) {
@@ -200,6 +254,7 @@ func (a *App) handleKey(m tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case overlayExit:
 		if key == "y" || key == "Y" {
 			a.quitting = true
+			a.stopCurrent()
 			return a, tea.Quit
 		}
 		a.over = overlayNone
@@ -221,6 +276,24 @@ func (a *App) handleKey(m tea.KeyMsg) (tea.Model, tea.Cmd) {
 		var cmd tea.Cmd
 		a.slash, cmd = a.slash.Update(m)
 		return a, cmd
+	case overlayLog:
+		switch key {
+		case "ctrl+c", "ctrl+d":
+			a.over = overlayExit
+			return a, nil
+		case "esc", "q", "v", "V":
+			a.over = overlayNone
+			return a, nil
+		case "g", "home":
+			a.logView.GotoTop()
+			return a, nil
+		case "G", "end":
+			a.logView.GotoBottom()
+			return a, nil
+		}
+		var cmd tea.Cmd
+		a.logView, cmd = a.logView.Update(m)
+		return a, cmd
 	}
 
 	switch key {
@@ -237,6 +310,9 @@ func (a *App) handleKey(m tea.KeyMsg) (tea.Model, tea.Cmd) {
 			a.over = overlaySlash
 			a.slash.Focus()
 			return a, textinput.Blink
+		case "v", "V":
+			a.openLog()
+			return a, nil
 		}
 	}
 	return a, a.cur.Update(m)
@@ -254,10 +330,81 @@ func (a *App) runSlash(name string) tea.Cmd {
 		if s := a.mach.Current(); s == state.FilestoreCSI || s == state.Autoscaling || s == state.Demo {
 			return goNext
 		}
+	case "log", "l", "view":
+		a.openLog()
 	case "exit", "quit", "q":
 		a.over = overlayExit
 	}
 	return nil
+}
+
+func (a *App) openLog() {
+	var lines []string
+	var title string
+
+	a.logFromComp = false
+	if p, ok := a.cur.(execCompProvider); ok && p.logComp() != nil {
+		lines = p.logComp().LogLines()
+		title = p.logComp().LogTitle()
+		a.logFromComp = len(lines) > 0
+	}
+	if len(lines) == 0 && a.deps.LogPath != "" {
+		if data, err := os.ReadFile(a.deps.LogPath); err == nil {
+			raw := strings.TrimRight(string(data), "\r\n")
+			if raw != "" {
+				rawLines := strings.Split(raw, "\n")
+				lines = make([]string, 0, len(rawLines))
+				for _, rl := range rawLines {
+					lines = append(lines, execx.Clean(rl))
+				}
+				title = filepath.Base(a.deps.LogPath)
+			}
+		}
+	}
+	if len(lines) == 0 {
+		lines = []string{"(no command output recorded yet)"}
+	}
+	if title == "" {
+		title = "Command output"
+	}
+	a.logTitle = title
+
+	header := a.headerView()
+	bottom := a.bottomView()
+	bodyH := a.height - lipgloss.Height(header) - lipgloss.Height(bottom) - 1
+
+	vpW := max(a.width-6, 20)
+	vpH := max(bodyH-6, 3)
+	a.logView = viewport.New(vpW, vpH)
+	a.logView.SetContent(strings.Join(lines, "\n"))
+	a.logView.GotoBottom()
+	a.over = overlayLog
+}
+
+func (a *App) logModalView(w, h int) string {
+	a.logView.Width = max(w-4, 20)
+	a.logView.Height = max(h-6, 3)
+
+	var b strings.Builder
+	// One line, always: a wrapped header would overflow the modal's exact
+	// line budget and clampHeight would chop the footer for it.
+	head := "Log: " + a.logTitle
+	if a.deps.LogPath != "" {
+		head += "  (" + a.deps.LogPath + ")"
+	}
+	if r := []rune(head); len(r) > max(w-4, 5) {
+		head = string(r[:max(w-4, 5)-1]) + "…"
+	}
+	b.WriteString(theme.Title.Render(head) + "\n")
+	b.WriteString(theme.Fainted.Render(strings.Repeat("─", max(w-4, 1))) + "\n")
+	b.WriteString(a.logView.View() + "\n")
+	b.WriteString(theme.Fainted.Render(strings.Repeat("─", max(w-4, 1))) + "\n")
+
+	pct := int(a.logView.ScrollPercent() * 100)
+	footer := fmt.Sprintf(" %d lines  ·  %d%%  ·  press [esc] or [v] to close", a.logView.TotalLineCount(), pct)
+	b.WriteString(theme.Subtle.Render(footer))
+
+	return theme.Panel.Width(w - 2).Render(b.String())
 }
 
 // View implements tea.Model.
@@ -270,6 +417,9 @@ func (a *App) View() string {
 	}
 
 	sidebarW := 30
+	if a.over == overlayLog {
+		sidebarW = 0
+	}
 	contentW := a.width - sidebarW - 3
 	if contentW < 40 {
 		sidebarW = 0
@@ -291,10 +441,20 @@ func (a *App) View() string {
 			a.cur.View(contentW),
 			theme.AccentPanel.Width(contentW-2).Render(a.slash.View()),
 		)
+	case overlayLog:
+		content = a.logModalView(contentW, bodyH)
 	default:
 		content = a.cur.View(contentW)
 	}
-	content = clampHeight(content, bodyH)
+	// The screen itself knows whether a command failed, so the clamp choice
+	// is not left to sniffing rendered strings — raw output that merely
+	// contains "failed" cannot flip a healthy screen's cropping.
+	if p, ok := a.cur.(execCompProvider); ok && a.over == overlayNone &&
+		p.logComp() != nil && p.logComp().failed != nil {
+		content = clampHeightAroundFailure(content, bodyH)
+	} else {
+		content = clampHeight(content, bodyH)
+	}
 
 	var body string
 	if sidebarW > 0 {

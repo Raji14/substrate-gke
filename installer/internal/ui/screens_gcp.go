@@ -291,6 +291,7 @@ func (s *clusterScreen) Init() tea.Cmd {
 }
 
 func (s *clusterScreen) CapturesText() bool { return s.mode == "name" }
+func (s *clusterScreen) logComp() *execComp   { return s.comp }
 
 func (s *clusterScreen) Hints() []Hint {
 	switch s.mode {
@@ -298,7 +299,9 @@ func (s *clusterScreen) Hints() []Hint {
 		return []Hint{{"enter", "create with this name"}, {"esc", "back to list"}}
 	case "probing":
 		if s.comp != nil && s.comp.failed != nil {
-			return []Hint{{"r", "retry"}, {"y", "continue without the check"}, {"esc", "back to list"}}
+			// No explicit "v" hint: bottomView appends it whenever the comp
+		// has output, and a second copy overflows narrow bottom bars.
+		return []Hint{{"r", "retry"}, {"y", "continue without the check"}, {"esc", "back to list"}}
 		}
 		return []Hint{{"esc", "cancel"}}
 	case "installed":
@@ -334,7 +337,7 @@ func (s *clusterScreen) probe(c gcp.Cluster) tea.Cmd {
 		return s.decide(c, res)
 	}
 	s.mode, s.parsed = "probing", false
-	s.comp = newExecComp(s.deps.Runner, snapshot.CheckInstalled(s.deps.Setup.ProjectID, c.Name, c.Location), nil)
+	s.comp = newExecComp(s.deps.Runner, snapshot.CheckInstalled(s.deps.Setup.ProjectID, c.Name, c.Location), nil, s.deps.LogPath)
 	return s.comp.start()
 }
 

@@ -102,7 +102,25 @@ func (a *App) sidebarView(w, h int) string {
 
 // bottomView is the persistent keymap bar (k9s-style, from the prototype).
 func (a *App) bottomView() string {
+	if a.over == overlayLog {
+		hints := []Hint{
+			{"esc/q/v", "close log"},
+			{"↑/↓, j/k", "scroll"},
+			{"g/G", "top/bottom"},
+			{"ctrl+c", "exit"},
+		}
+		parts := make([]string, 0, len(hints))
+		for _, hint := range hints {
+			parts = append(parts, theme.Key.Render("["+hint.Key+"]")+" "+theme.Subtle.Render(hint.Label))
+		}
+		line := " " + strings.Join(parts, theme.Fainted.Render("  ·  "))
+		return theme.Fainted.Render(strings.Repeat("─", max(a.width, 1))) + "\n" + line
+	}
+
 	hints := a.cur.Hints()
+	if p, ok := a.cur.(execCompProvider); ok && p.logComp() != nil && len(p.logComp().lines) > 0 {
+		hints = append(hints, Hint{"v", "view log"})
+	}
 	hints = append(hints,
 		Hint{"?", "help"},
 		Hint{"/", "commands"},
@@ -123,8 +141,9 @@ func (a *App) helpView(w int) string {
 		{"↑/↓, j/k, 1-9", "move / choose an option"},
 		{"b, esc", "go back one step"},
 		{"r", "re-run the current step's checks or command"},
+		{"v", "view full command output / scrollable log"},
 		{"m", "toggle the command drawer (deploy steps)"},
-		{"/", "slash commands: /help /back /skip /exit"},
+		{"/", "slash commands: /help /back /skip /log /exit"},
 		{"ctrl+c", "exit (asks for confirmation)"},
 	}
 	var b strings.Builder
@@ -145,7 +164,7 @@ func (a *App) exitView(w int) string {
 	return theme.ErrorPanel.Width(min(w-2, 64)).Render(msg)
 }
 
-// clampHeight truncates rendered content to at most h lines.
+// clampHeight truncates rendered content to at most h lines, keeping the top.
 func clampHeight(s string, h int) string {
 	if h <= 0 {
 		return s
@@ -153,6 +172,31 @@ func clampHeight(s string, h int) string {
 	lines := strings.Split(s, "\n")
 	if len(lines) <= h {
 		return s
+	}
+	return strings.Join(lines[:h], "\n")
+}
+
+// clampHeightAroundFailure clamps overflowing content to the window that
+// keeps the failure banner and what follows it — the cause, the [v]/[r]
+// guidance, the log path — on screen. The window starts at the banner
+// (guidance below beats context above), sliding up only when the banner is
+// close enough to the bottom to leave the window short. The caller decides
+// when to use it off the component's own failed state; bottom-anchoring
+// unconditionally would drop the banner whenever the tail panel below it is
+// taller than the window.
+func clampHeightAroundFailure(s string, h int) string {
+	if h <= 0 {
+		return s
+	}
+	lines := strings.Split(s, "\n")
+	if len(lines) <= h {
+		return s
+	}
+	for i, l := range lines {
+		if strings.Contains(l, "Command failed") {
+			start := min(i, len(lines)-h)
+			return strings.Join(lines[start:start+h], "\n")
+		}
 	}
 	return strings.Join(lines[:h], "\n")
 }

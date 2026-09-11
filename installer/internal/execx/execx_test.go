@@ -32,11 +32,42 @@ func collect(t *testing.T, ch <-chan Event) (lines []string, final Event) {
 	return nil, Event{}
 }
 
+// The viewer re-emits cleaned lines verbatim, so anything that would move
+// the cursor or reprogram the terminal has to be gone: embedded \r overwrite
+// sequences keep only what a terminal would have shown, and OSC escapes are
+// stripped alongside CSI ones.
+func TestCleanNeutralizesTerminalControl(t *testing.T) {
+	for in, want := range map[string]string{
+		"10%\r50%\r100%":                             "100%",
+		"progress\r\n":                               "progress",
+		"\x1b]0;title\x07after":                      "after",
+		"\x1b]8;;https://x\x1b\\link":                "link",
+		"\x1b[2Kplain\x1b[1;31m red\x1b[0m":          "plain red",
+		"mixed\rfinal \x1b]0;t\x07\x1b[32mok\x1b[0m": "final ok",
+	} {
+		if got := Clean(in); got != want {
+			t.Errorf("Clean(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
 func TestRealStreamsOutputAndExit(t *testing.T) {
-	ch := Real{}.Start(context.Background(), Spec{
+	ch := (&Real{}).Start(context.Background(), Spec{
 		Argv: []string{"sh", "-c", `printf 'one\n\x1b[1;36mtwo\x1b[0m\n'; echo err >&2`},
 	})
-	lines, final := collect(t, ch)
+	var stderrLines []string
+	lines := []string{}
+	var final Event
+	for ev := range ch {
+		if ev.Done {
+			final = ev
+			break
+		}
+		lines = append(lines, ev.Line)
+		if ev.Stderr {
+			stderrLines = append(stderrLines, ev.Line)
+		}
+	}
 	if final.Err != nil {
 		t.Fatalf("unexpected error: %v", final.Err)
 	}
@@ -50,10 +81,13 @@ func TestRealStreamsOutputAndExit(t *testing.T) {
 			t.Errorf("missing line %q in %v", want, lines)
 		}
 	}
+	if len(stderrLines) != 1 || stderrLines[0] != "err" {
+		t.Errorf("expected stderrLines = [\"err\"], got %v", stderrLines)
+	}
 }
 
 func TestRealReportsFailure(t *testing.T) {
-	ch := Real{}.Start(context.Background(), Spec{Argv: []string{"sh", "-c", "exit 3"}})
+	ch := (&Real{}).Start(context.Background(), Spec{Argv: []string{"sh", "-c", "exit 3"}})
 	_, final := collect(t, ch)
 	if final.Err == nil {
 		t.Fatal("want an error for exit 3")
@@ -62,7 +96,7 @@ func TestRealReportsFailure(t *testing.T) {
 
 func TestRealAppliesEnvAndDir(t *testing.T) {
 	dir := t.TempDir()
-	ch := Real{}.Start(context.Background(), Spec{
+	ch := (&Real{}).Start(context.Background(), Spec{
 		Argv: []string{"sh", "-c", "echo $FOO; pwd"},
 		Env:  []string{"FOO=bar"},
 		Dir:  dir,

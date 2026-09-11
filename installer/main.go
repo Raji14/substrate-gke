@@ -73,9 +73,21 @@ func main() {
 		return
 	}
 
-	var runner execx.Runner = execx.Real{}
+	logger, err := execx.NewLogger("")
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "warning: could not create log file:", err)
+	} else {
+		defer logger.Close()
+	}
+
+	var runner execx.Runner = &execx.Real{Log: logger}
 	if *dryRun {
-		runner = execx.DryRun{}
+		runner = execx.DryRun{Log: logger}
+	}
+
+	logPath := ""
+	if logger != nil {
+		logPath = logger.Path()
 	}
 
 	deps := &ui.Deps{
@@ -85,6 +97,7 @@ func main() {
 		Builder: snapshot.NewBuilder(root, managed),
 		Checks:  doctor.Checks(root, managed),
 		DryRun:  *dryRun,
+		LogPath: logPath,
 	}
 	if dir, err := snapshot.DefaultUpgradeDir(); err == nil {
 		deps.UpgradeDir = dir
@@ -103,6 +116,9 @@ func main() {
 	if _, err := tea.NewProgram(app, tea.WithAltScreen()).Run(); err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
 		os.Exit(1)
+	}
+	if d, ok := runner.(interface{ Drain() }); ok {
+		d.Drain()
 	}
 
 	// Only once the install actually worked, and never against a simulated
@@ -131,12 +147,18 @@ func printSummary(app *ui.App, deps *ui.Deps, cleaned bool) {
 	st, b := deps.Setup, deps.Builder
 	if !app.Completed {
 		fmt.Println("Setup exited early — nothing to summarize. Re-running the installer is safe.")
+		if deps.LogPath != "" {
+			fmt.Printf("\nDetailed command log written to:\n  %s\n", theme.Accent.Render(deps.LogPath))
+		}
 		return
 	}
 	if st.Upgrade {
 		installedDir, nextDir := b.UpgradeTrees(deps.UpgradeDir, st)
 		fmt.Println(theme.Good.Render("Upgrade prepared."))
 		fmt.Println(b.UpgradeSummary(st, installedDir, nextDir))
+		if deps.LogPath != "" {
+			fmt.Printf("\n  log        %s\n", deps.LogPath)
+		}
 		return
 	}
 	section := func(title string) { fmt.Println("\n" + theme.Title.Render(title)) }
@@ -152,6 +174,9 @@ func printSummary(app *ui.App, deps *ui.Deps, cleaned bool) {
 	section("Resources")
 	fmt.Printf("  project    %s\n  cluster    %s (%s)\n  bucket     gs://%s\n  images     %s\n",
 		st.ProjectID, st.ClusterName, st.Zone, st.BucketName, st.ImageSummary())
+	if deps.LogPath != "" {
+		fmt.Printf("  log        %s\n", deps.LogPath)
+	}
 	if st.FilestoreCSIDeployed {
 		fmt.Println("  filestore  CSI driver deployed (gcp-filestore-csi-driver)")
 	}
